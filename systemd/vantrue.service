@@ -1,0 +1,16 @@
+[Unit]
+Description=Vantrue Automation
+After=vantrue-updater.service
+Requires=vantrue-updater.service
+
+[Service]
+Type=simple
+User=picar
+WorkingDirectory=/home/picar/vantrue-automation/pi-vantrue
+ExecStart=/usr/bin/python3 /home/picar/vantrue-automation/pi-vantrue/main.py
+
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,15 @@
+[Unit]
+Description=Vantrue Automation Git Updater
+After=NetworkManager.service
+Wants=NetworkManager.service
+Before=vantrue.service
+
+[Service]
+Type=oneshot
+User=picar
+WorkingDirectory=/home/picar/vantrue-automation/pi-vantrue
+ExecStart=/home/picar/vantrue-automation/pi-vantrue/scripts/update.sh
+TimeoutStartSec=60
+
+[Install]
+WantedBy=multi-user.target
