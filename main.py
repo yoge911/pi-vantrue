@@ -4,28 +4,36 @@ import time
 
 
 VANTRUE_NETWORK = "E3_VANTRUE_13c6"   # Replace with exact nmcli connection name
-HOME_NETWORK = "o2-WLAN96-2.4"
+IPHONE_NETWORK = "iPhone"             # Target connection for future cloud uploads
 
 RETRY_CYCLE_SECONDS = 30
 
 
-def connect(network_name: str) -> bool:
+def connect(network_name: str, timeout_seconds: int = 10) -> bool:
     """Try to activate a saved NetworkManager connection."""
 
     print(f"[Network] Trying: {network_name}", flush=True)
 
-    result = subprocess.run(
-        [
-            "sudo",
-            "-n",
-            "nmcli",
-            "connection",
-            "up",
-            network_name,
-        ],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            [
+                "nmcli",
+                "--wait",
+                str(timeout_seconds),
+                "connection",
+                "up",
+                network_name,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds + 2,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"[Network] Connection attempt to {network_name} timed out.", flush=True)
+        return False
+    except Exception as exc:
+        print(f"[Network] Failed to execute nmcli for {network_name}: {exc}", flush=True)
+        return False
 
     if result.returncode == 0:
         print(f"[Network] Connected to {network_name}", flush=True)
@@ -62,33 +70,21 @@ def network_cycle():
     """
     Main operational network logic.
 
-    Important:
-    The iPhone/Git update step is NOT handled here.
-    vantrue-updater.service already handles that during boot.
+    Separation of Responsibilities:
+    - vantrue-updater.service handles boot-time iPhone hotspot connection for Git update.
+    - main.py handles operational Vantrue Wi-Fi synchronization.
+    - If Vantrue Wi-Fi is unavailable, wait and retry. Home Wi-Fi is left to NetworkManager
+      for ambient SSH/development access and is not actively managed here.
+    - Future cloud-upload flow: after buffering videos from Vantrue, main.py will switch
+      to IPHONE_NETWORK to upload files to cloud, then return to VANTRUE_NETWORK.
     """
 
-    # Priority 1 after deployment: Vantrue dashcam
     if connect(VANTRUE_NETWORK):
         run_vantrue_sync()
         return
 
-    # Vantrue unavailable -> try home network
     print(
-        "[Network] Vantrue unavailable. Trying home Wi-Fi...",
-        flush=True,
-    )
-
-    if connect(HOME_NETWORK):
-        print(
-            "[Network] Home Wi-Fi available. "
-            "Waiting for next Vantrue attempt.",
-            flush=True,
-        )
-        return
-
-    # Nothing available
-    print(
-        "[Network] Neither Vantrue nor home Wi-Fi is available.",
+        "[Network] Vantrue Wi-Fi unavailable. Will retry in next cycle.",
         flush=True,
     )
 

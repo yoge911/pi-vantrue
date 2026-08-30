@@ -1,7 +1,7 @@
 [Unit]
 Description=Vantrue Automation
 After=vantrue-updater.service
-Requires=vantrue-updater.service
+Wants=vantrue-updater.service
 
 [Service]
 Type=simple
