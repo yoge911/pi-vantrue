@@ -59,3 +59,8 @@ class Config:
     INTERNET_CHECK_URL = os.environ.get(
         "INTERNET_CHECK_URL", "http://connectivitycheck.gstatic.com/generate_204"
     )
+
+    # Preservation Request HTTP API settings
+    PRESERVE_API_HOST = os.environ.get("PRESERVE_API_HOST", "0.0.0.0")
+    PRESERVE_API_PORT = int(os.environ.get("PRESERVE_API_PORT", 8765))
+    MAX_HTTP_BODY_BYTES = int(os.environ.get("MAX_HTTP_BODY_BYTES", 16384))  # 16 KB payload cap

@@ -1,0 +1,15 @@
+[Unit]
+Description=Vantrue Preservation Request API
+After=network.target
+
+[Service]
+Type=simple
+User=picar
+WorkingDirectory=/home/picar/vantrue-automation/pi-vantrue
+ExecStart=/usr/bin/python3 /home/picar/vantrue-automation/pi-vantrue/preserve_api.py
+
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

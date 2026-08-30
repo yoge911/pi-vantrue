@@ -1,6 +1,6 @@
 import sqlite3
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 
 class SyncDB:
@@ -14,6 +14,11 @@ class SyncDB:
     def _get_connection(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.db_path), timeout=10.0)
         conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA busy_timeout=5000;")
+        except sqlite3.OperationalError:
+            pass  # Fallback if filesystem does not support WAL
         return conn
 
     def _init_db(self):
@@ -43,6 +48,25 @@ class SyncDB:
                 """
                 CREATE INDEX IF NOT EXISTS idx_recordings_timestamp
                 ON recordings(recording_timestamp);
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS preservation_requests (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    request_id TEXT UNIQUE NOT NULL,
+                    from_time TEXT NOT NULL,
+                    to_time TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_preservation_status
+                ON preservation_requests(status);
                 """
             )
             conn.commit()
@@ -170,3 +194,38 @@ class SyncDB:
             if row and row["total_size"]:
                 return int(row["total_size"])
             return 0
+
+    def add_preservation_request(
+        self, request_id: str, from_time: str, to_time: str, status: str = "pending"
+    ) -> Tuple[bool, str]:
+        """
+        Insert a new preservation request idempotently.
+        Returns (True, "created") on success, or (False, "already_exists") on duplicate request_id.
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            try:
+                cursor.execute(
+                    """
+                    INSERT INTO preservation_requests (request_id, from_time, to_time, status)
+                    VALUES (?, ?, ?, ?);
+                    """,
+                    (request_id, from_time, to_time, status),
+                )
+                conn.commit()
+                return True, "created"
+            except sqlite3.IntegrityError:
+                return False, "already_exists"
+
+    def get_pending_preservation_requests(self) -> List[sqlite3.Row]:
+        """Fetch all pending preservation requests ordered by creation time."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT * FROM preservation_requests
+                WHERE status = 'pending'
+                ORDER BY created_at ASC;
+                """
+            )
+            return cursor.fetchall()
