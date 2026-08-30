@@ -67,7 +67,7 @@ def run_vantrue_sync():
 
     try:
         engine = VantrueSyncEngine()
-        engine.run_sync()
+        engine.run_sync(on_file_downloaded=run_upload_cycle)
     except Exception as exc:
         print(f"[Vantrue] Error during video sync: {exc}", flush=True)
 

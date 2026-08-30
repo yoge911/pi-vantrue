@@ -6,7 +6,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from config import Config
 from db import SyncDB
@@ -133,7 +133,7 @@ class VantrueSyncEngine:
             curr_gb = current_buffer / (1024 ** 3)
             max_gb = max_buffer / (1024 ** 3)
             print(
-                f"[Sync] Buffer limit reached. Local buffer: {curr_gb:.2f} GB / {max_gb:.2f} GB. Waiting for upload stage.",
+                f"[Sync] Local buffer safety ceiling reached ({curr_gb:.2f} GB / {max_gb:.2f} GB). Pausing download until space is released by cloud upload.",
                 flush=True,
             )
             return False, "buffer_limit_reached"
@@ -213,7 +213,7 @@ class VantrueSyncEngine:
                 part_path.unlink(missing_ok=True)
             return False
 
-    def run_sync(self):
+    def run_sync(self, on_file_downloaded: Optional[Callable[[], None]] = None):
         """Execute full video discovery, ordering, limit verification, and download loop."""
         try:
             discovered = self.scan_remote_recordings()
@@ -257,3 +257,10 @@ class VantrueSyncEngine:
             current_buf_gb = self.get_current_local_buffer_size() / (1024 ** 3)
             max_buf_gb = self.config.MAX_BUFFER_BYTES / (1024 ** 3)
             print(f"[Sync] Local buffer: {current_buf_gb:.2f} GB / {max_buf_gb:.2f} GB", flush=True)
+
+            # Invoke callback immediately after each file download completes
+            if on_file_downloaded:
+                try:
+                    on_file_downloaded()
+                except Exception as cb_exc:
+                    print(f"[Sync] Callback error after downloading {recording_dict['filename']}: {cb_exc}", flush=True)
