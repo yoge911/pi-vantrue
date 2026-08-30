@@ -17,6 +17,8 @@ def connect(network_name: str, timeout_seconds: int = 10) -> bool:
     try:
         result = subprocess.run(
             [
+                "sudo",
+                "-n",
                 "nmcli",
                 "--wait",
                 str(timeout_seconds),

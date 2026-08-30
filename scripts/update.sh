@@ -17,7 +17,7 @@ start_time=$(date +%s)
 iphone_connected=false
 
 # Trigger an initial active Wi-Fi scan to discover nearby iPhone hotspot
-nmcli device wifi rescan >/dev/null 2>&1 || true
+sudo -n nmcli device wifi rescan >/dev/null 2>&1 || true
 
 while true; do
     now=$(date +%s)
@@ -42,13 +42,13 @@ while true; do
     fi
 
     if [ "$timeout_cap" -ge 1 ]; then
-        if timeout "$timeout_cap" nmcli --wait "$nmcli_wait" connection up "$IPHONE_CONNECTION" >/dev/null 2>&1; then
+        if timeout "$timeout_cap" sudo -n nmcli --wait "$nmcli_wait" connection up "$IPHONE_CONNECTION" >/dev/null 2>&1; then
             echo "[Updater] Connected to iPhone hotspot."
             iphone_connected=true
             break
         fi
     else
-        if nmcli --wait "$nmcli_wait" connection up "$IPHONE_CONNECTION" >/dev/null 2>&1; then
+        if sudo -n nmcli --wait "$nmcli_wait" connection up "$IPHONE_CONNECTION" >/dev/null 2>&1; then
             echo "[Updater] Connected to iPhone hotspot."
             iphone_connected=true
             break
@@ -66,7 +66,7 @@ while true; do
     fi
 
     # Trigger Wi-Fi rescan for next attempt
-    nmcli device wifi rescan >/dev/null 2>&1 || true
+    sudo -n nmcli device wifi rescan >/dev/null 2>&1 || true
 
     if [ "$remaining" -lt "$RETRY_INTERVAL" ]; then
         sleep "$remaining"
