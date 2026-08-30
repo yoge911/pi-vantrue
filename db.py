@@ -114,6 +114,49 @@ class SyncDB:
                 return True
             return False
 
+    def get_pending_uploads(self) -> List[sqlite3.Row]:
+        """Fetch downloaded recordings awaiting upload sorted chronologically oldest-first."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT * FROM recordings
+                WHERE status = 'downloaded'
+                ORDER BY recording_timestamp ASC, filename ASC;
+                """
+            )
+            return cursor.fetchall()
+
+    def mark_uploaded(self, remote_url: str):
+        """Mark a recording as successfully uploaded to cloud storage."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE recordings
+                SET status = 'uploaded',
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE remote_url = ?;
+                """,
+                (remote_url,),
+            )
+            conn.commit()
+
+    def mark_deleted(self, remote_url: str):
+        """Mark a recording as deleted locally after confirmed cloud upload."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE recordings
+                SET status = 'deleted',
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE remote_url = ?;
+                """,
+                (remote_url,),
+            )
+            conn.commit()
+
     def get_downloaded_buffer_size(self) -> int:
         """Calculate total bytes of files currently marked as downloaded."""
         with self._get_connection() as conn:

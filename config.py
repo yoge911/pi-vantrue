@@ -47,3 +47,15 @@ class Config:
 
     # Chunk size for streaming HTTP downloads (128 KB)
     DOWNLOAD_CHUNK_SIZE = 128 * 1024
+
+    # rclone configuration settings
+    RCLONE_REMOTE = os.environ.get("RCLONE_REMOTE", "gdrive:")
+    RCLONE_DESTINATION = os.environ.get("RCLONE_DESTINATION", "Vantrue")
+
+    # Timeout for single file upload via rclone (Default: 300 seconds / 5 minutes)
+    RCLONE_UPLOAD_TIMEOUT = int(os.environ.get("RCLONE_UPLOAD_TIMEOUT", 300))
+
+    # Bounded internet connectivity verification URL
+    INTERNET_CHECK_URL = os.environ.get(
+        "INTERNET_CHECK_URL", "http://connectivitycheck.gstatic.com/generate_204"
+    )
