@@ -2,6 +2,9 @@ import subprocess
 import sys
 import time
 
+from config import Config
+from vantrue_sync import VantrueSyncEngine
+
 
 VANTRUE_NETWORK = "E3_VANTRUE_13c6"   # Replace with exact nmcli connection name
 IPHONE_NETWORK = "iPhone"             # Target connection for future cloud uploads
@@ -51,19 +54,21 @@ def connect(network_name: str, timeout_seconds: int = 10) -> bool:
 
 def run_vantrue_sync():
     """
-    Vantrue synchronization workflow.
-
-    We will implement this next:
-      1. Read Vantrue HTTP file listing
-      2. Find unsynced videos
-      3. Start with oldest files
-      4. Download until local buffer limit is reached
-      5. Store sync state
+    Vantrue synchronization workflow:
+      1. Query Vantrue HTTP directory listing
+      2. Store discovered files in SQLite database
+      3. Process pending videos in oldest-first chronological order
+      4. Verify local buffer & free space safety limits
+      5. Atomically download to .part file and rename to .mp4 upon completion
     """
 
     print("[Vantrue] Starting video sync...", flush=True)
 
-    # Placeholder for now.
+    try:
+        engine = VantrueSyncEngine()
+        engine.run_sync()
+    except Exception as exc:
+        print(f"[Vantrue] Error during video sync: {exc}", flush=True)
 
     print("[Vantrue] Video sync finished.", flush=True)
 
@@ -75,11 +80,19 @@ def network_cycle():
     Separation of Responsibilities:
     - vantrue-updater.service handles boot-time iPhone hotspot connection for Git update.
     - main.py handles operational Vantrue Wi-Fi synchronization.
-    - If Vantrue Wi-Fi is unavailable, wait and retry. Home Wi-Fi is left to NetworkManager
-      for ambient SSH/development access and is not actively managed here.
-    - Future cloud-upload flow: after buffering videos from Vantrue, main.py will switch
-      to IPHONE_NETWORK to upload files to cloud, then return to VANTRUE_NETWORK.
+    - Mock/Development Mode: If VANTRUE_BASE_URL is explicitly set in environment,
+      skip Wi-Fi activation and proceed directly to run_vantrue_sync().
+    - Production Mode: Connect to VANTRUE_NETWORK, then run_vantrue_sync().
+      If Vantrue Wi-Fi is unavailable, wait and retry in next cycle.
     """
+
+    if Config.IS_EXPLICIT_BASE_URL:
+        print(
+            "[Network] VANTRUE_BASE_URL explicitly configured; skipping Vantrue Wi-Fi activation for mock testing.",
+            flush=True,
+        )
+        run_vantrue_sync()
+        return
 
     if connect(VANTRUE_NETWORK):
         run_vantrue_sync()

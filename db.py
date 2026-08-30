@@ -1,0 +1,129 @@
+import sqlite3
+from pathlib import Path
+from typing import Dict, List, Optional
+
+
+class SyncDB:
+    """SQLite Database Manager for tracking Vantrue recording sync state."""
+
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_db()
+
+    def _get_connection(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(str(self.db_path), timeout=10.0)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _init_db(self):
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS recordings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    remote_url TEXT UNIQUE NOT NULL,
+                    filename TEXT NOT NULL,
+                    file_size INTEGER DEFAULT 0,
+                    recording_timestamp TEXT,
+                    status TEXT NOT NULL CHECK(status IN ('discovered', 'downloaded', 'uploaded', 'deleted')),
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_recordings_status
+                ON recordings(status);
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_recordings_timestamp
+                ON recordings(recording_timestamp);
+                """
+            )
+            conn.commit()
+
+    def register_recordings(self, recordings: List[Dict]):
+        """Register newly discovered recordings into database."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            for rec in recordings:
+                cursor.execute(
+                    """
+                    INSERT INTO recordings (
+                        remote_url, filename, file_size, recording_timestamp, status
+                    ) VALUES (?, ?, ?, ?, 'discovered')
+                    ON CONFLICT(remote_url) DO UPDATE SET
+                        file_size = COALESCE(EXCLUDED.file_size, recordings.file_size),
+                        recording_timestamp = COALESCE(EXCLUDED.recording_timestamp, recordings.recording_timestamp)
+                    """,
+                    (
+                        rec["remote_url"],
+                        rec["filename"],
+                        rec.get("file_size", 0),
+                        rec.get("recording_timestamp", ""),
+                    ),
+                )
+            conn.commit()
+
+    def get_pending_downloads(self) -> List[sqlite3.Row]:
+        """Fetch discovered recordings sorted chronologically oldest-first."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT * FROM recordings
+                WHERE status = 'discovered'
+                ORDER BY recording_timestamp ASC, filename ASC;
+                """
+            )
+            return cursor.fetchall()
+
+    def mark_downloaded(self, remote_url: str, file_size: int):
+        """Mark a recording as successfully downloaded."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE recordings
+                SET status = 'downloaded',
+                    file_size = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE remote_url = ?;
+                """,
+                (file_size, remote_url),
+            )
+            conn.commit()
+
+    def is_already_downloaded_or_synced(self, remote_url: str) -> bool:
+        """Check if remote_url has already been downloaded or uploaded."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT status FROM recordings WHERE remote_url = ?;
+                """,
+                (remote_url,),
+            )
+            row = cursor.fetchone()
+            if row and row["status"] in ("downloaded", "uploaded"):
+                return True
+            return False
+
+    def get_downloaded_buffer_size(self) -> int:
+        """Calculate total bytes of files currently marked as downloaded."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT SUM(file_size) as total_size FROM recordings WHERE status = 'downloaded';
+                """
+            )
+            row = cursor.fetchone()
+            if row and row["total_size"]:
+                return int(row["total_size"])
+            return 0

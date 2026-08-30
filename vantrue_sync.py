@@ -1,0 +1,259 @@
+import html.parser
+import os
+import re
+import shutil
+import urllib.parse
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+from config import Config
+from db import SyncDB
+
+
+class VantrueHTMLParser(html.parser.HTMLParser):
+    """HTML parser to extract video file hyperlinks from HTTP directory listings."""
+
+    def __init__(self, base_url: str):
+        super().__init__()
+        self.base_url = base_url
+        self.links: List[str] = []
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]):
+        if tag.lower() == "a":
+            for name, val in attrs:
+                if name.lower() == "href" and val:
+                    # Resolve relative link against base_url
+                    full_url = urllib.parse.urljoin(self.base_url, val)
+                    unquoted_path = urllib.parse.unquote(full_url)
+                    path_lower = unquoted_path.lower()
+
+                    if any(path_lower.endswith(ext) for ext in Config.SUPPORTED_EXTENSIONS):
+                        if full_url not in self.links:
+                            self.links.append(full_url)
+
+
+def extract_timestamp_from_filename(filename: str) -> str:
+    """
+    Extract a sortable timestamp string (YYYY-MM-DD HH:MM:SS) from a video filename.
+    Handles Vantrue dashcam filename structures like:
+      - 20260822_142136_00358_N_A.MP4
+      - 20260830_105041_0001_A.MP4
+      - 20260830105041.MP4
+    """
+    clean_name = Path(filename).name
+
+    # Vantrue pattern: YYYYMMDD_HHMMSS (with optional sequence number e.g. 00358)
+    match = re.search(r"(\d{4})[_-]?(\d{2})[_-]?(\d{2})[_-]?(\d{2})[_-]?(\d{2})[_-]?(\d{2})(?:[_-](\d+))?", clean_name)
+    if match:
+        year, month, day, hour, minute, second, seq = match.groups()
+        formatted_time = f"{year}-{month}-{day} {hour}:{minute}:{second}"
+        if seq:
+            return f"{formatted_time}_{seq.zfill(5)}"
+        return formatted_time
+
+    # Secondary pattern: 8 digits (YYYYMMDD)
+    match_date = re.search(r"(\d{4})[_-]?(\d{2})[_-]?(\d{2})", clean_name)
+    if match_date:
+        year, month, day = match_date.groups()
+        return f"{year}-{month}-{day} 00:00:00"
+
+    # Default fallback: return clean filename for lexicographical sorting
+    return clean_name
+
+
+class VantrueSyncEngine:
+    """Main synchronization engine for Vantrue HTTP video downloads."""
+
+    def __init__(self, config: type = Config):
+        self.config = config
+        self.db = SyncDB(self.config.DB_PATH)
+        self.config.LOCAL_DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+    def scan_remote_recordings(self) -> List[Dict]:
+        """Query HTTP directory listing and return discovered video metadata."""
+        url = self.config.VANTRUE_BASE_URL
+        print(f"[Sync] Querying Vantrue recordings from {url}...", flush=True)
+
+        req = urllib.request.Request(url, headers={"User-Agent": "VantruePiAutomation/1.0"})
+        with urllib.request.urlopen(req, timeout=self.config.HTTP_TIMEOUT) as response:
+            content_type = response.headers.get("Content-Type", "")
+            html_content = response.read().decode("utf-8", errors="ignore")
+
+        parser = VantrueHTMLParser(url)
+        parser.feed(html_content)
+
+        discovered = []
+        for file_url in parser.links:
+            filename = urllib.parse.unquote(Path(urllib.parse.urlparse(file_url).path).name)
+            timestamp = extract_timestamp_from_filename(filename)
+
+            # Try HEAD request to get file size if server supports it
+            file_size = 0
+            try:
+                head_req = urllib.request.Request(file_url, method="HEAD", headers={"User-Agent": "VantruePiAutomation/1.0"})
+                with urllib.request.urlopen(head_req, timeout=self.config.HTTP_TIMEOUT) as head_resp:
+                    content_length = head_resp.headers.get("Content-Length")
+                    if content_length and content_length.isdigit():
+                        file_size = int(content_length)
+            except Exception:
+                pass  # Optional enhancement; ignore HEAD errors
+
+            discovered.append({
+                "remote_url": file_url,
+                "filename": filename,
+                "file_size": file_size,
+                "recording_timestamp": timestamp,
+            })
+
+        print(f"[Sync] Found {len(discovered)} video files on HTTP server.", flush=True)
+        return discovered
+
+    def get_current_local_buffer_size(self) -> int:
+        """Calculate current total size of downloaded files in local buffer directory."""
+        if not self.config.LOCAL_DOWNLOAD_DIR.exists():
+            return 0
+        total_size = 0
+        for entry in self.config.LOCAL_DOWNLOAD_DIR.iterdir():
+            if entry.is_file() and not entry.name.endswith(".part"):
+                total_size += entry.stat().st_size
+        return total_size
+
+    def check_storage_limits(self, next_file_size: int = 0) -> Tuple[bool, str]:
+        """
+        Verify if downloading the next file satisfies:
+        1. Local video buffer limit (MAX_BUFFER_BYTES)
+        2. Free disk space safety reserve (MIN_FREE_DISK_BYTES)
+        """
+        current_buffer = self.get_current_local_buffer_size()
+        max_buffer = self.config.MAX_BUFFER_BYTES
+
+        if current_buffer + next_file_size > max_buffer:
+            curr_gb = current_buffer / (1024 ** 3)
+            max_gb = max_buffer / (1024 ** 3)
+            print(
+                f"[Sync] Buffer limit reached. Local buffer: {curr_gb:.2f} GB / {max_gb:.2f} GB. Waiting for upload stage.",
+                flush=True,
+            )
+            return False, "buffer_limit_reached"
+
+        # Check actual filesystem space on Pi SD card
+        usage = shutil.disk_usage(self.config.LOCAL_DOWNLOAD_DIR)
+        free_space = usage.free
+        min_reserve = self.config.MIN_FREE_DISK_BYTES
+
+        if free_space - next_file_size < min_reserve:
+            free_gb = free_space / (1024 ** 3)
+            reserve_gb = min_reserve / (1024 ** 3)
+            print(
+                f"[Sync] Disk space safety reserve limit reached. Available: {free_gb:.2f} GB (Required reserve: {reserve_gb:.2f} GB). Stopping download.",
+                flush=True,
+            )
+            return False, "disk_reserve_reached"
+
+        return True, "ok"
+
+    def download_file(self, recording: Dict) -> bool:
+        """
+        Download a single video file using a temporary .part file and atomic rename.
+        Restart-safe & idempotent.
+        """
+        remote_url = recording["remote_url"]
+        filename = recording["filename"]
+
+        final_path = self.config.LOCAL_DOWNLOAD_DIR / filename
+        part_path = self.config.LOCAL_DOWNLOAD_DIR / f"{filename}.part"
+
+        # If already downloaded physically and in DB, skip
+        if final_path.exists() and final_path.stat().st_size > 0:
+            if self.db.is_already_downloaded_or_synced(remote_url):
+                print(f"[Sync] File {filename} already downloaded. Skipping.", flush=True)
+                return True
+
+        # Remove incomplete .part file from previous interrupted run
+        if part_path.exists():
+            print(f"[Sync] Removing incomplete temporary file: {part_path.name}", flush=True)
+            part_path.unlink(missing_ok=True)
+
+        print(f"[Sync] Downloading {filename}...", flush=True)
+
+        req = urllib.request.Request(remote_url, headers={"User-Agent": "VantruePiAutomation/1.0"})
+
+        try:
+            with urllib.request.urlopen(req, timeout=self.config.HTTP_TIMEOUT) as response:
+                if response.status != 200:
+                    print(f"[Sync] HTTP error {response.status} downloading {filename}", flush=True)
+                    return False
+
+                total_size = int(response.headers.get("Content-Length", 0))
+
+                with open(part_path, "wb") as out_file:
+                    downloaded_bytes = 0
+                    while True:
+                        chunk = response.read(self.config.DOWNLOAD_CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        out_file.write(chunk)
+                        downloaded_bytes += len(chunk)
+
+            # Atomic rename from .part to final filename
+            os.replace(part_path, final_path)
+
+            final_size = final_path.stat().st_size
+            self.db.mark_downloaded(remote_url, final_size)
+
+            size_mb = final_size / (1024 * 1024)
+            print(f"[Sync] Download completed: {filename} ({size_mb:.1f} MB)", flush=True)
+            return True
+
+        except Exception as exc:
+            print(f"[Sync] Download failed for {filename}: {exc}", flush=True)
+            if part_path.exists():
+                part_path.unlink(missing_ok=True)
+            return False
+
+    def run_sync(self):
+        """Execute full video discovery, ordering, limit verification, and download loop."""
+        try:
+            discovered = self.scan_remote_recordings()
+        except Exception as exc:
+            print(f"[Sync] Vantrue HTTP endpoint unavailable or error: {exc}. Will retry later.", flush=True)
+            return
+
+        if not discovered:
+            print("[Sync] No video files found on server.", flush=True)
+            return
+
+        # Register in database
+        self.db.register_recordings(discovered)
+
+        # Get pending downloads sorted chronologically oldest-first
+        pending = self.db.get_pending_downloads()
+
+        if not pending:
+            print("[Sync] All discovered videos have already been downloaded.", flush=True)
+            return
+
+        print(f"[Sync] Found {len(pending)} pending videos to download.", flush=True)
+
+        oldest_pending = pending[0]
+        print(f"[Sync] Oldest pending recording: {oldest_pending['filename']} (Timestamp: {oldest_pending['recording_timestamp']})", flush=True)
+
+        for rec in pending:
+            recording_dict = dict(rec)
+            expected_size = recording_dict.get("file_size", 0)
+
+            # Check buffer and disk space constraints
+            can_download, reason = self.check_storage_limits(expected_size)
+            if not can_download:
+                break
+
+            success = self.download_file(recording_dict)
+            if not success:
+                print(f"[Sync] Stopping current sync cycle due to download error on {recording_dict['filename']}.", flush=True)
+                break
+
+            current_buf_gb = self.get_current_local_buffer_size() / (1024 ** 3)
+            max_buf_gb = self.config.MAX_BUFFER_BYTES / (1024 ** 3)
+            print(f"[Sync] Local buffer: {current_buf_gb:.2f} GB / {max_buf_gb:.2f} GB", flush=True)
