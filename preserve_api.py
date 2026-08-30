@@ -49,7 +49,12 @@ class PreserveAPIHandler(BaseHTTPRequestHandler):
             )
             return
 
+        content_type_header = self.headers.get("Content-Type")
         content_length_header = self.headers.get("Content-Length")
+
+        print(f"[PreserveAPI DEBUG] Content-Type: {content_type_header}", flush=True)
+        print(f"[PreserveAPI DEBUG] Content-Length: {content_length_header}", flush=True)
+
         if not content_length_header or not content_length_header.isdigit():
             print("[PreserveAPI] Invalid request: Missing Content-Length header.", flush=True)
             self._send_json(
@@ -69,6 +74,7 @@ class PreserveAPIHandler(BaseHTTPRequestHandler):
 
         try:
             raw_body = self.rfile.read(content_length)
+            print(f"[PreserveAPI DEBUG] Raw body: {repr(raw_body)}", flush=True)
             payload = json.loads(raw_body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             print(f"[PreserveAPI] Invalid request: Failed to parse JSON body ({exc}).", flush=True)
