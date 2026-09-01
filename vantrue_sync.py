@@ -1,7 +1,9 @@
 import html.parser
+import logging
 import os
 import re
 import shutil
+import time
 import urllib.parse
 import urllib.request
 from datetime import datetime
@@ -10,6 +12,9 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from config import Config
 from db import SyncDB
+
+logger = logging.getLogger("sync")
+storage_logger = logging.getLogger("storage")
 
 
 class VantrueHTMLParser(html.parser.HTMLParser):
@@ -74,7 +79,7 @@ class VantrueSyncEngine:
     def scan_remote_recordings(self) -> List[Dict]:
         """Query HTTP directory listing and return discovered video metadata."""
         url = self.config.VANTRUE_BASE_URL
-        print(f"[Sync] Querying Vantrue recordings from {url}...", flush=True)
+        logger.info(f"Querying Vantrue recordings directory from endpoint {url}...")
 
         req = urllib.request.Request(url, headers={"User-Agent": "VantruePiAutomation/1.0"})
         with urllib.request.urlopen(req, timeout=self.config.HTTP_TIMEOUT) as response:
@@ -107,7 +112,7 @@ class VantrueSyncEngine:
                 "recording_timestamp": timestamp,
             })
 
-        print(f"[Sync] Found {len(discovered)} video files on HTTP server.", flush=True)
+        logger.info(f"Discovered {len(discovered)} video files on dashcam HTTP server.")
         return discovered
 
     def get_current_local_buffer_size(self) -> int:
@@ -132,9 +137,8 @@ class VantrueSyncEngine:
         if current_buffer + next_file_size > max_buffer:
             curr_gb = current_buffer / (1024 ** 3)
             max_gb = max_buffer / (1024 ** 3)
-            print(
-                f"[Sync] Local buffer safety ceiling reached ({curr_gb:.2f} GB / {max_gb:.2f} GB). Pausing download until space is released by cloud upload.",
-                flush=True,
+            storage_logger.warning(
+                f"Local buffer safety ceiling reached ({curr_gb:.2f} GB / {max_gb:.2f} GB). Pausing download until space is released by cloud upload."
             )
             return False, "buffer_limit_reached"
 
@@ -146,9 +150,8 @@ class VantrueSyncEngine:
         if free_space - next_file_size < min_reserve:
             free_gb = free_space / (1024 ** 3)
             reserve_gb = min_reserve / (1024 ** 3)
-            print(
-                f"[Sync] Disk space safety reserve limit reached. Available: {free_gb:.2f} GB (Required reserve: {reserve_gb:.2f} GB). Stopping download.",
-                flush=True,
+            storage_logger.warning(
+                f"Disk space safety reserve limit reached. Available: {free_gb:.2f} GB (Required reserve: {reserve_gb:.2f} GB). Stopping download."
             )
             return False, "disk_reserve_reached"
 
@@ -168,22 +171,23 @@ class VantrueSyncEngine:
         # If already downloaded physically and in DB, skip
         if final_path.exists() and final_path.stat().st_size > 0:
             if self.db.is_already_downloaded_or_synced(remote_url):
-                print(f"[Sync] File {filename} already downloaded. Skipping.", flush=True)
+                logger.debug(f"File '{filename}' already downloaded and indexed in DB. Skipping.")
                 return True
 
         # Remove incomplete .part file from previous interrupted run
         if part_path.exists():
-            print(f"[Sync] Removing incomplete temporary file: {part_path.name}", flush=True)
+            logger.info(f"Removing incomplete temporary file '{part_path.name}'.")
             part_path.unlink(missing_ok=True)
 
-        print(f"[Sync] Downloading {filename}...", flush=True)
+        logger.info(f"Download started file={filename} url={remote_url} dest={final_path}")
+        start_time = time.time()
 
         req = urllib.request.Request(remote_url, headers={"User-Agent": "VantruePiAutomation/1.0"})
 
         try:
             with urllib.request.urlopen(req, timeout=self.config.HTTP_TIMEOUT) as response:
                 if response.status != 200:
-                    print(f"[Sync] HTTP error {response.status} downloading {filename}", flush=True)
+                    logger.error(f"HTTP error {response.status} downloading '{filename}'.")
                     return False
 
                 total_size = int(response.headers.get("Content-Length", 0))
@@ -200,15 +204,19 @@ class VantrueSyncEngine:
             # Atomic rename from .part to final filename
             os.replace(part_path, final_path)
 
+            duration = time.time() - start_time
             final_size = final_path.stat().st_size
             self.db.mark_downloaded(remote_url, final_size)
 
             size_mb = final_size / (1024 * 1024)
-            print(f"[Sync] Download completed: {filename} ({size_mb:.1f} MB)", flush=True)
+            logger.info(
+                f"Download completed file={filename} bytes={final_size} duration={duration:.1f}s ({size_mb:.1f} MB)"
+            )
             return True
 
         except Exception as exc:
-            print(f"[Sync] Download failed for {filename}: {exc}", flush=True)
+            duration = time.time() - start_time
+            logger.error(f"Download failed for '{filename}' after {duration:.1f}s: {exc}")
             if part_path.exists():
                 part_path.unlink(missing_ok=True)
             return False
@@ -218,11 +226,11 @@ class VantrueSyncEngine:
         try:
             discovered = self.scan_remote_recordings()
         except Exception as exc:
-            print(f"[Sync] Vantrue HTTP endpoint unavailable or error: {exc}. Will retry later.", flush=True)
+            logger.info(f"Vantrue HTTP endpoint unreachable: {exc}. Will retry in next cycle.")
             return
 
         if not discovered:
-            print("[Sync] No video files found on server.", flush=True)
+            logger.info("No video files found on Vantrue HTTP server.")
             return
 
         # Register in database
@@ -232,13 +240,13 @@ class VantrueSyncEngine:
         pending = self.db.get_pending_downloads()
 
         if not pending:
-            print("[Sync] All discovered videos have already been downloaded.", flush=True)
+            logger.info("All discovered videos have already been downloaded.")
             return
 
-        print(f"[Sync] Found {len(pending)} pending videos to download.", flush=True)
+        logger.info(f"Found {len(pending)} pending videos to download from dashcam.")
 
         oldest_pending = pending[0]
-        print(f"[Sync] Oldest pending recording: {oldest_pending['filename']} (Timestamp: {oldest_pending['recording_timestamp']})", flush=True)
+        logger.info(f"Oldest pending recording: {oldest_pending['filename']} (Timestamp: {oldest_pending['recording_timestamp']})")
 
         for rec in pending:
             recording_dict = dict(rec)
@@ -251,16 +259,17 @@ class VantrueSyncEngine:
 
             success = self.download_file(recording_dict)
             if not success:
-                print(f"[Sync] Stopping current sync cycle due to download error on {recording_dict['filename']}.", flush=True)
+                logger.warning(f"Stopping current sync cycle due to download error on '{recording_dict['filename']}'.")
                 break
 
             current_buf_gb = self.get_current_local_buffer_size() / (1024 ** 3)
             max_buf_gb = self.config.MAX_BUFFER_BYTES / (1024 ** 3)
-            print(f"[Sync] Local buffer: {current_buf_gb:.2f} GB / {max_buf_gb:.2f} GB", flush=True)
+            storage_logger.info(f"Local buffer: {current_buf_gb:.2f} GB / {max_buf_gb:.2f} GB")
 
             # Invoke callback immediately after each file download completes
             if on_file_downloaded:
                 try:
                     on_file_downloaded()
                 except Exception as cb_exc:
-                    print(f"[Sync] Callback error after downloading {recording_dict['filename']}: {cb_exc}", flush=True)
+                    logger.error(f"Callback error after downloading '{recording_dict['filename']}': {cb_exc}")
+

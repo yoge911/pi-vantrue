@@ -5,11 +5,29 @@ from pathlib import Path
 class Config:
     """Central configuration for Vantrue Automation System."""
 
+    # Dual-Interface Architecture Configuration
+    VANTRUE_INTERFACE = os.environ.get("VANTRUE_INTERFACE", "wlan0")
+    INTERNET_INTERFACE = os.environ.get("INTERNET_INTERFACE", "wlan1")
+
+    VANTRUE_NETWORK = os.environ.get("VANTRUE_NETWORK", "E3_VANTRUE_13c6")
+    IPHONE_NETWORK = os.environ.get("IPHONE_NETWORK", "iPhone 1")
+
+    # Logging Configuration
+    LOG_DIR = Path(
+        os.environ.get(
+            "LOG_DIR",
+            "/home/picar/vantrue-automation/logs",
+        )
+    )
+    LOG_FILE = LOG_DIR / "vantrue.log"
+    LOG_MAX_BYTES = int(os.environ.get("LOG_MAX_BYTES", 5 * 1024 * 1024))  # 5 MB
+    LOG_BACKUP_COUNT = int(os.environ.get("LOG_BACKUP_COUNT", 5))
+
     # Flag indicating whether VANTRUE_BASE_URL was explicitly provided in environment
     IS_EXPLICIT_BASE_URL = "VANTRUE_BASE_URL" in os.environ
 
     # Base URL for Vantrue dashcam HTTP interface or Mac mock server
-    VANTRUE_BASE_URL = os.environ.get("VANTRUE_BASE_URL", "http://127.0.0.1:8000/").rstrip("/") + "/"
+    VANTRUE_BASE_URL = os.environ.get("VANTRUE_BASE_URL", "http://192.168.1.254/").rstrip("/") + "/"
 
     # Local video buffer directory
     LOCAL_DOWNLOAD_DIR = Path(
@@ -64,3 +82,4 @@ class Config:
     PRESERVE_API_HOST = os.environ.get("PRESERVE_API_HOST", "0.0.0.0")
     PRESERVE_API_PORT = int(os.environ.get("PRESERVE_API_PORT", 8765))
     MAX_HTTP_BODY_BYTES = int(os.environ.get("MAX_HTTP_BODY_BYTES", 16384))  # 16 KB payload cap
+

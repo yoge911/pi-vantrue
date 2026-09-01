@@ -1,11 +1,15 @@
+import logging
 import os
 import subprocess
+import time
 import urllib.request
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 from config import Config
 from db import SyncDB
+
+logger = logging.getLogger("upload")
 
 
 class VantrueUploader:
@@ -23,9 +27,13 @@ class VantrueUploader:
                 url, headers={"User-Agent": "VantruePiAutomation/1.0"}
             )
             with urllib.request.urlopen(req, timeout=timeout_seconds) as response:
-                return response.status in (200, 204)
+                if response.status in (200, 204):
+                    logger.debug("Internet connectivity verified successfully.")
+                    return True
+                logger.warning(f"Internet check returned HTTP status {response.status}.")
+                return False
         except Exception as exc:
-            print(f"[Upload] Internet connectivity check failed: {exc}", flush=True)
+            logger.info(f"Internet connectivity check unavailable: {exc}")
             return False
 
     def upload_file_rclone(self, recording: Dict) -> bool:
@@ -37,23 +45,22 @@ class VantrueUploader:
         local_path = self.config.LOCAL_DOWNLOAD_DIR / filename
 
         if not local_path.exists() or not local_path.is_file():
-            print(
-                f"[Upload] Warning: Local file {filename} does not exist. Skipping upload.",
-                flush=True,
+            logger.warning(
+                f"Local file '{filename}' does not exist. Skipping upload."
             )
             return False
 
         if filename.endswith(".part"):
-            print(
-                f"[Upload] Skipping incomplete temporary file {filename}.",
-                flush=True,
-            )
+            logger.warning(f"Skipping incomplete temporary file '{filename}'.")
             return False
 
         rclone_target = (
             f"{self.config.RCLONE_REMOTE}{self.config.RCLONE_DESTINATION}/{filename}"
         )
-        print(f"[Upload] Uploading {filename} to {rclone_target}...", flush=True)
+        file_size_bytes = local_path.stat().st_size if local_path.exists() else 0
+        file_size_mb = file_size_bytes / (1024 * 1024)
+
+        logger.info(f"Upload started file={filename} size={file_size_mb:.1f}MB target={rclone_target}")
 
         cmd = [
             "rclone",
@@ -62,6 +69,7 @@ class VantrueUploader:
             rclone_target,
         ]
 
+        start_time = time.time()
         try:
             result = subprocess.run(
                 cmd,
@@ -70,30 +78,35 @@ class VantrueUploader:
                 timeout=self.config.RCLONE_UPLOAD_TIMEOUT,
             )
         except subprocess.TimeoutExpired:
-            print(
-                f"[Upload] rclone timed out uploading {filename}. Local copy preserved.",
-                flush=True,
+            duration = time.time() - start_time
+            logger.error(
+                f"rclone timed out uploading '{filename}' after {duration:.1f}s. Local copy preserved."
             )
             return False
         except Exception as exc:
-            print(
-                f"[Upload] Failed to execute rclone for {filename}: {exc}. Local copy preserved.",
-                flush=True,
+            logger.error(
+                f"Failed to execute rclone for '{filename}': {exc}. Local copy preserved."
             )
             return False
 
+        duration = time.time() - start_time
         if result.returncode == 0:
-            print(f"[Upload] Upload completed: {filename}", flush=True)
+            logger.info(
+                f"Upload completed file={filename} bytes={file_size_bytes} duration={duration:.1f}s"
+            )
             return True
 
         err_msg = result.stderr.strip() if result.stderr else f"Exit code {result.returncode}"
-        print(
-            f"[Upload] rclone failed for {filename}: {err_msg}. Local copy preserved.",
-            flush=True,
+        logger.error(
+            f"rclone failed for '{filename}': {err_msg}. Local copy preserved."
         )
         return False
 
-    def run_upload_cycle(self, connect_wifi_fn: Optional[Callable[[str], bool]] = None, iphone_network_name: str = "iPhone"):
+    def run_upload_cycle(
+        self,
+        connect_wifi_fn: Optional[Callable[[str], bool]] = None,
+        iphone_network_name: str = "iPhone 1",
+    ):
         """
         Execute full upload cycle for pending recordings.
         Sequence:
@@ -101,47 +114,35 @@ class VantrueUploader:
           2. Check network state (Mock mode vs Production mode).
           3. Upload one file at a time using rclone.
           4. Safe state transition: uploaded -> delete local file -> deleted.
-          5. Return to Vantrue network if switched.
         """
         pending = self.db.get_pending_uploads()
 
         if not pending:
-            print("[Upload] No recordings awaiting cloud upload.", flush=True)
+            logger.debug("No recordings awaiting cloud upload.")
             return
 
-        print(f"[Upload] {len(pending)} recordings awaiting upload.", flush=True)
+        logger.info(f"{len(pending)} recordings awaiting upload.")
 
         # Network handling
         if self.config.IS_EXPLICIT_BASE_URL:
-            print(
-                "[Upload] Mock mode active; verifying internet on current network...",
-                flush=True,
-            )
+            logger.info("Mock mode active; verifying internet on current network...")
             if not self.check_internet_connectivity():
-                print(
-                    "[Upload] Internet unavailable on current network. Upload postponed.",
-                    flush=True,
-                )
+                logger.info("Internet unavailable on current network. Upload postponed.")
                 return
         else:
-            # Production mode: Connect to iPhone hotspot using existing network function
-            if connect_wifi_fn:
-                print("[Upload] Connecting to iPhone hotspot...", flush=True)
-                if not connect_wifi_fn(iphone_network_name):
-                    print(
-                        "[Upload] iPhone hotspot unavailable. Upload postponed.",
-                        flush=True,
-                    )
+            # Production mode: Check internet connectivity first (e.g. wlan1 already connected to iPhone or Home Wi-Fi)
+            if not self.check_internet_connectivity():
+                if connect_wifi_fn:
+                    logger.info(f"Connecting wlan1 to hotspot network '{iphone_network_name}'...")
+                    if not connect_wifi_fn(iphone_network_name):
+                        logger.info("Hotspot network unavailable. Upload postponed.")
+                        return
+
+                if not self.check_internet_connectivity():
+                    logger.info("Internet connection unavailable on hotspot. Upload postponed.")
                     return
 
-            if not self.check_internet_connectivity():
-                print(
-                    "[Upload] Internet connection unavailable on iPhone hotspot. Upload postponed.",
-                    flush=True,
-                )
-                return
-
-        print("[Upload] Internet connection available.", flush=True)
+        logger.info("Internet connection available for cloud upload.")
 
         for rec in pending:
             recording_dict = dict(rec)
@@ -153,27 +154,27 @@ class VantrueUploader:
             success = self.upload_file_rclone(recording_dict)
 
             if not success:
-                print(
-                    f"[Upload] Upload failed for {filename}. Halting upload cycle.",
-                    flush=True,
-                )
+                logger.warning(f"Upload failed for '{filename}'. Halting upload cycle.")
                 break
 
             # 2. Confirmed upload -> Mark uploaded in SQLite
             self.db.mark_uploaded(remote_url)
-            print(f"[Upload] Marked recording as uploaded: {filename}", flush=True)
+            logger.info(f"Marked recording as uploaded in DB: {filename}")
 
-            # 3. Local deletion -> Delete local video file
+            # 3. Local deletion & DB update -> Delete local video file only, then record mark_deleted
             try:
                 if local_path.exists():
                     local_path.unlink()
-                    print(f"[Upload] Deleted local copy: {filename}", flush=True)
+                    logger.info(f"Cleanup: Deleted local copy of '{filename}' after successful upload.")
+                else:
+                    logger.info(f"Local file '{filename}' already removed.")
+
+                # 4. Record local cleanup in SQLite strictly after confirmed deletion
+                self.db.mark_deleted(remote_url)
+                logger.info(f"Local buffer space released for '{filename}' in DB.")
             except Exception as exc:
-                print(
-                    f"[Upload] Warning: Local deletion failed for {filename}: {exc}",
-                    flush=True,
+                logger.error(
+                    f"Local deletion failed for '{filename}': {exc}. Skipping mark_deleted in DB."
                 )
 
-            # 4. Record local cleanup in SQLite
-            self.db.mark_deleted(remote_url)
-            print(f"[Upload] Local buffer space released for {filename}.", flush=True)
+
