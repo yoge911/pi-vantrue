@@ -69,6 +69,12 @@ class SyncDB:
                 ON preservation_requests(status);
                 """
             )
+            # Automatic idempotent schema migration for uploaded_at timestamp
+            try:
+                cursor.execute("ALTER TABLE recordings ADD COLUMN uploaded_at TIMESTAMP;")
+            except sqlite3.OperationalError:
+                pass
+
             conn.commit()
 
     def register_recordings(self, recordings: List[Dict]):
@@ -151,6 +157,42 @@ class SyncDB:
             )
             return cursor.fetchall()
 
+    def get_uploaded_recordings(self) -> List[sqlite3.Row]:
+        """Fetch all uploaded recordings sorted chronologically oldest-first for rolling cache cleanup."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT * FROM recordings
+                WHERE status = 'uploaded'
+                ORDER BY recording_timestamp ASC, filename ASC;
+                """
+            )
+            return cursor.fetchall()
+
+    def get_all_recordings(self, filter_status: Optional[str] = None, sort_desc: bool = True) -> List[sqlite3.Row]:
+        """Fetch recordings with optional status filter and timestamp ordering."""
+        order = "DESC" if sort_desc else "ASC"
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            if filter_status and filter_status != "all":
+                cursor.execute(
+                    f"""
+                    SELECT * FROM recordings
+                    WHERE status = ?
+                    ORDER BY recording_timestamp {order}, filename {order};
+                    """,
+                    (filter_status,),
+                )
+            else:
+                cursor.execute(
+                    f"""
+                    SELECT * FROM recordings
+                    ORDER BY recording_timestamp {order}, filename {order};
+                    """
+                )
+            return cursor.fetchall()
+
     def mark_uploaded(self, remote_url: str):
         """Mark a recording as successfully uploaded to cloud storage."""
         with self._get_connection() as conn:
@@ -159,6 +201,7 @@ class SyncDB:
                 """
                 UPDATE recordings
                 SET status = 'uploaded',
+                    uploaded_at = CURRENT_TIMESTAMP,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE remote_url = ?;
                 """,
@@ -180,6 +223,32 @@ class SyncDB:
                 (remote_url,),
             )
             conn.commit()
+
+    def get_stats(self) -> Dict:
+        """Get summary statistics for dashboard display."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT
+                    COUNT(*) as total_discovered,
+                    SUM(CASE WHEN status = 'downloaded' THEN 1 ELSE 0 END) as pending_upload_count,
+                    SUM(CASE WHEN status = 'uploaded' THEN 1 ELSE 0 END) as uploaded_count,
+                    SUM(CASE WHEN status in ('downloaded', 'uploaded') THEN 1 ELSE 0 END) as local_count,
+                    SUM(CASE WHEN status in ('downloaded', 'uploaded') THEN file_size ELSE 0 END) as local_size,
+                    MAX(CASE WHEN status = 'uploaded' THEN updated_at ELSE NULL END) as last_uploaded_at
+                FROM recordings;
+                """
+            )
+            row = cursor.fetchone()
+            return {
+                "total_discovered": row["total_discovered"] or 0,
+                "pending_upload_count": row["pending_upload_count"] or 0,
+                "uploaded_count": row["uploaded_count"] or 0,
+                "local_count": row["local_count"] or 0,
+                "local_size": row["local_size"] or 0,
+                "last_uploaded_at": row["last_uploaded_at"],
+            }
 
     def get_downloaded_buffer_size(self) -> int:
         """Calculate total bytes of files currently marked as downloaded."""
@@ -229,3 +298,4 @@ class SyncDB:
                 """
             )
             return cursor.fetchall()
+

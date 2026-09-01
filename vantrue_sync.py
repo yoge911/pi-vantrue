@@ -12,9 +12,11 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from config import Config
 from db import SyncDB
+from retention import RetentionManager
 
 logger = logging.getLogger("sync")
 storage_logger = logging.getLogger("storage")
+
 
 
 class VantrueHTMLParser(html.parser.HTMLParser):
@@ -129,7 +131,8 @@ class VantrueSyncEngine:
         """
         Verify if downloading the next file satisfies:
         1. Local video buffer limit (MAX_BUFFER_BYTES)
-        2. Free disk space safety reserve (MIN_FREE_DISK_BYTES)
+        2. Minimum free disk space safety threshold (MIN_FREE_DISK_BYTES / MIN_FREE_SPACE_GB)
+           by triggering rolling cleanup of oldest uploaded files if necessary.
         """
         current_buffer = self.get_current_local_buffer_size()
         max_buffer = self.config.MAX_BUFFER_BYTES
@@ -142,9 +145,15 @@ class VantrueSyncEngine:
             )
             return False, "buffer_limit_reached"
 
-        # Check actual filesystem space on Pi SD card
-        usage = shutil.disk_usage(self.config.LOCAL_DOWNLOAD_DIR)
-        free_space = usage.free
+        # Trigger rolling cache cleanup of oldest uploaded files if free space is below threshold
+        retention_mgr = RetentionManager(self.config)
+        safe, status_code = retention_mgr.cleanup_uploaded_files_if_needed()
+
+        if not safe:
+            return False, status_code
+
+        # Re-verify actual disk space with next_file_size reserve
+        free_space = retention_mgr.get_free_space_bytes()
         min_reserve = self.config.MIN_FREE_DISK_BYTES
 
         if free_space - next_file_size < min_reserve:
@@ -156,6 +165,7 @@ class VantrueSyncEngine:
             return False, "disk_reserve_reached"
 
         return True, "ok"
+
 
     def download_file(self, recording: Dict) -> bool:
         """

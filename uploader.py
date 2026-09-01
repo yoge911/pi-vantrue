@@ -157,24 +157,9 @@ class VantrueUploader:
                 logger.warning(f"Upload failed for '{filename}'. Halting upload cycle.")
                 break
 
-            # 2. Confirmed upload -> Mark uploaded in SQLite
+            # 2. Confirmed upload -> Mark uploaded in SQLite & retain local copy for rolling cache
             self.db.mark_uploaded(remote_url)
-            logger.info(f"Marked recording as uploaded in DB: {filename}")
+            logger.info(f"Upload verified for '{filename}'. Retaining file in local rolling cache.")
 
-            # 3. Local deletion & DB update -> Delete local video file only, then record mark_deleted
-            try:
-                if local_path.exists():
-                    local_path.unlink()
-                    logger.info(f"Cleanup: Deleted local copy of '{filename}' after successful upload.")
-                else:
-                    logger.info(f"Local file '{filename}' already removed.")
-
-                # 4. Record local cleanup in SQLite strictly after confirmed deletion
-                self.db.mark_deleted(remote_url)
-                logger.info(f"Local buffer space released for '{filename}' in DB.")
-            except Exception as exc:
-                logger.error(
-                    f"Local deletion failed for '{filename}': {exc}. Skipping mark_deleted in DB."
-                )
 
 

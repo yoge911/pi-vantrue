@@ -1,0 +1,16 @@
+[Unit]
+Description=Vantrue Automation Web Interface & Video Streaming
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=simple
+User=picar
+WorkingDirectory=/home/picar/vantrue-automation/pi-vantrue
+ExecStart=/usr/bin/python3 /home/picar/vantrue-automation/pi-vantrue/web_server.py
+
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

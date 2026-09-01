@@ -47,10 +47,15 @@ class Config:
         os.environ.get("MAX_BUFFER_BYTES", 10 * 1024 * 1024 * 1024)
     )
 
-    # Minimum free disk space safety reserve (Default: 5 GB)
+    # Minimum free disk space threshold for rolling cache cleanup (Default: 15 GB)
+    MIN_FREE_SPACE_GB = int(os.environ.get("MIN_FREE_SPACE_GB", 15))
     MIN_FREE_DISK_BYTES = int(
-        os.environ.get("MIN_FREE_DISK_BYTES", 5 * 1024 * 1024 * 1024)
+        os.environ.get("MIN_FREE_DISK_BYTES", MIN_FREE_SPACE_GB * 1024 * 1024 * 1024)
     )
+
+    # Web Dashboard & Video Streaming Server Configuration
+    WEB_HOST = os.environ.get("WEB_HOST", "0.0.0.0")
+    WEB_PORT = int(os.environ.get("WEB_PORT", 8080))
 
     # Supported video file extensions
     SUPPORTED_EXTENSIONS = (
@@ -82,4 +87,5 @@ class Config:
     PRESERVE_API_HOST = os.environ.get("PRESERVE_API_HOST", "0.0.0.0")
     PRESERVE_API_PORT = int(os.environ.get("PRESERVE_API_PORT", 8765))
     MAX_HTTP_BODY_BYTES = int(os.environ.get("MAX_HTTP_BODY_BYTES", 16384))  # 16 KB payload cap
+
 
