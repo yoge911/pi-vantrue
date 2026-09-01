@@ -12,70 +12,115 @@ class SyncDB:
         self._init_db()
 
     def _get_connection(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.db_path), timeout=10.0)
+        conn = sqlite3.connect(str(self.db_path), timeout=20.0)
         conn.row_factory = sqlite3.Row
         try:
             conn.execute("PRAGMA journal_mode=WAL;")
+        except Exception:
+            pass
+        try:
             conn.execute("PRAGMA busy_timeout=5000;")
-        except sqlite3.OperationalError:
-            pass  # Fallback if filesystem does not support WAL
+        except Exception:
+            pass
         return conn
 
     def _init_db(self):
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS recordings (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    remote_url TEXT UNIQUE NOT NULL,
-                    filename TEXT NOT NULL,
-                    file_size INTEGER DEFAULT 0,
-                    recording_timestamp TEXT,
-                    status TEXT NOT NULL CHECK(status IN ('discovered', 'downloaded', 'uploaded', 'deleted')),
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-                """
-            )
-            cursor.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_recordings_status
-                ON recordings(status);
-                """
-            )
-            cursor.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_recordings_timestamp
-                ON recordings(recording_timestamp);
-                """
-            )
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS preservation_requests (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    request_id TEXT UNIQUE NOT NULL,
-                    from_time TEXT NOT NULL,
-                    to_time TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'pending',
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-                """
-            )
-            cursor.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_preservation_status
-                ON preservation_requests(status);
-                """
-            )
-            # Automatic idempotent schema migration for uploaded_at timestamp
-            try:
-                cursor.execute("ALTER TABLE recordings ADD COLUMN uploaded_at TIMESTAMP;")
-            except sqlite3.OperationalError:
-                pass
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS recordings (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        remote_url TEXT UNIQUE NOT NULL,
+                        filename TEXT NOT NULL,
+                        file_size INTEGER DEFAULT 0,
+                        recording_timestamp TEXT,
+                        status TEXT NOT NULL CHECK(status IN ('discovered', 'downloaded', 'uploaded', 'deleted')),
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_recordings_status
+                    ON recordings(status);
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_recordings_timestamp
+                    ON recordings(recording_timestamp);
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS preservation_requests (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        request_id TEXT UNIQUE NOT NULL,
+                        from_time TEXT NOT NULL,
+                        to_time TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'pending',
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_preservation_status
+                    ON preservation_requests(status);
+                    """
+                )
+                # Automatic idempotent schema migration for uploaded_at timestamp
+                try:
+                    cursor.execute("ALTER TABLE recordings ADD COLUMN uploaded_at TIMESTAMP;")
+                except Exception:
+                    pass
 
-            conn.commit()
+                conn.commit()
+        except sqlite3.OperationalError:
+            pass
+
+    def sync_physical_files(self, download_dir: Path):
+        """
+        Scan download_dir for physical video files and reconcile DB status.
+        If a file exists on disk but is marked 'deleted' or missing from DB,
+        update status to 'downloaded' (or 'uploaded' if previously uploaded).
+        """
+        if not download_dir.exists():
+            return
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                for entry in download_dir.iterdir():
+                    if entry.is_file() and not entry.name.endswith(".part"):
+                        fn = entry.name
+                        size = entry.stat().st_size
+                        cursor.execute("SELECT * FROM recordings WHERE filename = ?;", (fn,))
+                        row = cursor.fetchone()
+                        if row:
+                            if row["status"] == "deleted":
+                                new_status = "uploaded" if (row["uploaded_at"] if "uploaded_at" in row.keys() else None) else "downloaded"
+                                cursor.execute(
+                                    "UPDATE recordings SET status = ?, file_size = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;",
+                                    (new_status, size, row["id"]),
+                                )
+                        else:
+                            dummy_url = f"local://{fn}"
+                            cursor.execute(
+                                """
+                                INSERT INTO recordings (remote_url, filename, file_size, recording_timestamp, status)
+                                VALUES (?, ?, ?, ?, 'downloaded')
+                                ON CONFLICT(remote_url) DO UPDATE SET status = 'downloaded', file_size = EXCLUDED.file_size;
+                                """,
+                                (dummy_url, fn, size, fn),
+                            )
+                conn.commit()
+        except Exception:
+            pass
+
 
     def register_recordings(self, recordings: List[Dict]):
         """Register newly discovered recordings into database."""

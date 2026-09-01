@@ -149,6 +149,7 @@ class VantrueWebHandler(BaseHTTPRequestHandler):
 
     def _handle_api_status(self):
         db = SyncDB(Config.DB_PATH)
+        db.sync_physical_files(Config.LOCAL_DOWNLOAD_DIR)
         stats = db.get_stats()
 
         # Storage calculations
@@ -200,9 +201,11 @@ class VantrueWebHandler(BaseHTTPRequestHandler):
         sort_order = params.get("sort", ["desc"])[0]
 
         db = SyncDB(Config.DB_PATH)
+        db.sync_physical_files(Config.LOCAL_DOWNLOAD_DIR)
         records = db.get_all_recordings(
             filter_status=filter_status, sort_desc=(sort_order == "desc")
         )
+
 
         base_dir = Config.LOCAL_DOWNLOAD_DIR.resolve()
         video_list = []
