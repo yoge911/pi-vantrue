@@ -57,12 +57,28 @@ class Config:
     WEB_HOST = os.environ.get("WEB_HOST", "0.0.0.0")
     WEB_PORT = int(os.environ.get("WEB_PORT", 8080))
 
-    # Supported video file extensions
+    # Priority Classifications (Lower number = Higher Priority)
+    PRIORITY_EVENT = 0
+    PRIORITY_NORMAL = 1
+    PRIORITY_GPS = 2
+    PRIORITY_PHOTO = 3
+    PRIORITY_OTHER = 4
+
+    # Delay in seconds between file size observations for stability verification
+    STABILITY_CHECK_DELAY = float(os.environ.get("STABILITY_CHECK_DELAY", "2.0"))
+
+    # Supported file extensions (videos, photos, GPS/log metadata)
     SUPPORTED_EXTENSIONS = (
         ".mp4",
         ".mov",
         ".ts",
         ".avi",
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".gps",
+        ".dat",
+        ".log",
     )
 
     # HTTP connection & read timeout in seconds

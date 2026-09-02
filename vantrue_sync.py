@@ -20,25 +20,79 @@ storage_logger = logging.getLogger("storage")
 
 
 class VantrueHTMLParser(html.parser.HTMLParser):
-    """HTML parser to extract video file hyperlinks from HTTP directory listings."""
+    """HTML parser to extract file hyperlinks and subfolder directory links from HTTP listings."""
 
     def __init__(self, base_url: str):
         super().__init__()
         self.base_url = base_url
-        self.links: List[str] = []
+        self.file_links: List[str] = []
+        self.dir_links: List[str] = []
 
     def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]):
         if tag.lower() == "a":
             for name, val in attrs:
                 if name.lower() == "href" and val:
-                    # Resolve relative link against base_url
+                    if val in ("../", "..", "./", "."):
+                        continue
                     full_url = urllib.parse.urljoin(self.base_url, val)
                     unquoted_path = urllib.parse.unquote(full_url)
                     path_lower = unquoted_path.lower()
 
                     if any(path_lower.endswith(ext) for ext in Config.SUPPORTED_EXTENSIONS):
-                        if full_url not in self.links:
-                            self.links.append(full_url)
+                        if full_url not in self.file_links:
+                            self.file_links.append(full_url)
+                    elif val.endswith("/") or (not Path(unquoted_path).suffix and full_url.startswith(self.base_url)):
+                        if full_url not in self.dir_links and full_url != self.base_url:
+                            self.dir_links.append(full_url)
+
+
+def classify_file_priority(remote_url: str, filename: str) -> int:
+    """
+    Classify recording priority (0=highest) based primarily on directory path,
+    falling back to filename patterns and extension matching.
+
+    Primary directory classification (authoritative):
+      - /Event/  -> Priority 0 (EVENT)
+      - /Normal/ -> Priority 1 (NORMAL)
+      - /GPS/    -> Priority 2 (GPS)
+      - /Photo/  -> Priority 3 (PHOTO)
+
+    Fallback classification:
+      - _E_, _EV_, _EMG_, event -> Priority 0
+      - _N_, _NOR_, normal      -> Priority 1
+      - .gps, .dat, .log, gps   -> Priority 2
+      - .jpg, .jpeg, .png, photo -> Priority 3
+      - Other                    -> Priority 4
+    """
+    parsed_path = urllib.parse.urlparse(remote_url).path
+    unquoted_path = urllib.parse.unquote(parsed_path)
+    path_parts = [p.lower() for p in unquoted_path.split("/") if p]
+    fn_lower = filename.lower()
+
+    # Primary: Authoritative Directory Path check
+    if "event" in path_parts:
+        return Config.PRIORITY_EVENT
+    if "normal" in path_parts:
+        return Config.PRIORITY_NORMAL
+    if "gps" in path_parts:
+        return Config.PRIORITY_GPS
+    if any(p in path_parts for p in ["photo", "photos", "picture", "pictures"]):
+        return Config.PRIORITY_PHOTO
+
+    # Secondary: Fallback Filename / Extension check
+    fn_stem = Path(fn_lower).stem
+    stem_tokens = [t for t in re.split(r"[_-]", fn_stem) if t]
+
+    if any(t in stem_tokens for t in ["e", "ev", "emg", "event"]) or "event" in fn_lower:
+        return Config.PRIORITY_EVENT
+    if any(t in stem_tokens for t in ["n", "nor", "normal"]) or "normal" in fn_lower:
+        return Config.PRIORITY_NORMAL
+    if fn_lower.endswith((".gps", ".dat", ".log")) or "gps" in fn_lower:
+        return Config.PRIORITY_GPS
+    if fn_lower.endswith((".jpg", ".jpeg", ".png")) or "photo" in fn_lower:
+        return Config.PRIORITY_PHOTO
+
+    return Config.PRIORITY_OTHER
 
 
 def extract_timestamp_from_filename(filename: str) -> str:
@@ -78,43 +132,106 @@ class VantrueSyncEngine:
         self.db = SyncDB(self.config.DB_PATH)
         self.config.LOCAL_DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
+    def get_remote_file_size(self, remote_url: str) -> int:
+        """Perform a HEAD request to observe remote file size in bytes."""
+        try:
+            req = urllib.request.Request(remote_url, method="HEAD", headers={"User-Agent": "VantruePiAutomation/1.0"})
+            with urllib.request.urlopen(req, timeout=self.config.HTTP_TIMEOUT) as head_resp:
+                content_length = head_resp.headers.get("Content-Length")
+                if content_length and content_length.isdigit():
+                    return int(content_length)
+        except Exception:
+            pass
+        return 0
+
+    def is_remote_file_stable(self, recording: Dict) -> bool:
+        """
+        Verify file completeness/stability via 2 matching size observations separated by STABILITY_CHECK_DELAY.
+        Returns False if size changes during observation window (indicating active writing).
+        """
+        remote_url = recording["remote_url"]
+        filename = recording["filename"]
+        delay = getattr(self.config, "STABILITY_CHECK_DELAY", 2.0)
+
+        # Observation 1
+        size_a = self.get_remote_file_size(remote_url)
+        if size_a <= 0:
+            size_a = recording.get("file_size", 0)
+
+        if size_a <= 0:
+            logger.debug(f"Unable to observe size for '{filename}'; treating as candidate stable.")
+            return True
+
+        if delay <= 0:
+            return True
+
+        time.sleep(delay)
+
+        # Observation 2
+        size_b = self.get_remote_file_size(remote_url)
+        if size_b <= 0:
+            size_b = size_a  # Fallback if second HEAD request transiently failed
+
+        if size_a != size_b:
+            logger.info(
+                f"File '{filename}' size changed ({size_a} B -> {size_b} B) over {delay}s delay. "
+                f"File is actively being written by dashcam. Skipping for now."
+            )
+            return False
+
+        return True
+
     def scan_remote_recordings(self) -> List[Dict]:
-        """Query HTTP directory listing and return discovered video metadata."""
+        """Query HTTP directory listing (including subfolders) and return discovered file metadata with priority."""
         url = self.config.VANTRUE_BASE_URL
         logger.info(f"Querying Vantrue recordings directory from endpoint {url}...")
 
-        req = urllib.request.Request(url, headers={"User-Agent": "VantruePiAutomation/1.0"})
-        with urllib.request.urlopen(req, timeout=self.config.HTTP_TIMEOUT) as response:
-            content_type = response.headers.get("Content-Type", "")
-            html_content = response.read().decode("utf-8", errors="ignore")
-
-        parser = VantrueHTMLParser(url)
-        parser.feed(html_content)
-
+        urls_to_visit = [url]
+        visited_urls = set()
         discovered = []
-        for file_url in parser.links:
-            filename = urllib.parse.unquote(Path(urllib.parse.urlparse(file_url).path).name)
-            timestamp = extract_timestamp_from_filename(filename)
+        discovered_urls = set()
 
-            # Try HEAD request to get file size if server supports it
-            file_size = 0
+        while urls_to_visit and len(visited_urls) < 10:
+            current_url = urls_to_visit.pop(0)
+            if current_url in visited_urls:
+                continue
+            visited_urls.add(current_url)
+
             try:
-                head_req = urllib.request.Request(file_url, method="HEAD", headers={"User-Agent": "VantruePiAutomation/1.0"})
-                with urllib.request.urlopen(head_req, timeout=self.config.HTTP_TIMEOUT) as head_resp:
-                    content_length = head_resp.headers.get("Content-Length")
-                    if content_length and content_length.isdigit():
-                        file_size = int(content_length)
-            except Exception:
-                pass  # Optional enhancement; ignore HEAD errors
+                req = urllib.request.Request(current_url, headers={"User-Agent": "VantruePiAutomation/1.0"})
+                with urllib.request.urlopen(req, timeout=self.config.HTTP_TIMEOUT) as response:
+                    html_content = response.read().decode("utf-8", errors="ignore")
+            except Exception as exc:
+                logger.debug(f"Failed to fetch directory listing at {current_url}: {exc}")
+                continue
 
-            discovered.append({
-                "remote_url": file_url,
-                "filename": filename,
-                "file_size": file_size,
-                "recording_timestamp": timestamp,
-            })
+            parser = VantrueHTMLParser(current_url)
+            parser.feed(html_content)
 
-        logger.info(f"Discovered {len(discovered)} video files on dashcam HTTP server.")
+            for file_url in parser.file_links:
+                if file_url in discovered_urls:
+                    continue
+                discovered_urls.add(file_url)
+
+                filename = urllib.parse.unquote(Path(urllib.parse.urlparse(file_url).path).name)
+                timestamp = extract_timestamp_from_filename(filename)
+                priority = classify_file_priority(file_url, filename)
+
+                file_size = self.get_remote_file_size(file_url)
+
+                discovered.append({
+                    "remote_url": file_url,
+                    "filename": filename,
+                    "file_size": file_size,
+                    "recording_timestamp": timestamp,
+                    "priority": priority,
+                })
+
+            for dir_url in parser.dir_links:
+                if dir_url not in visited_urls and dir_url not in urls_to_visit:
+                    urls_to_visit.append(dir_url)
+
+        logger.info(f"Discovered {len(discovered)} supported files on dashcam HTTP server.")
         return discovered
 
     def get_current_local_buffer_size(self) -> int:
@@ -232,45 +349,57 @@ class VantrueSyncEngine:
             return False
 
     def run_sync(self, on_file_downloaded: Optional[Callable[[], None]] = None):
-        """Execute full video discovery, ordering, limit verification, and download loop."""
-        try:
-            discovered = self.scan_remote_recordings()
-        except Exception as exc:
-            logger.info(f"Vantrue HTTP endpoint unreachable: {exc}. Will retry in next cycle.")
-            return
+        """Execute full video discovery, ordering, stability verification, and download loop."""
+        while True:
+            try:
+                discovered = self.scan_remote_recordings()
+            except Exception as exc:
+                logger.info(f"Vantrue HTTP endpoint unreachable: {exc}. Will retry in next cycle.")
+                return
 
-        if not discovered:
-            logger.info("No video files found on Vantrue HTTP server.")
-            return
+            if not discovered:
+                logger.info("No video files found on Vantrue HTTP server.")
+                return
 
-        # Register in database
-        self.db.register_recordings(discovered)
+            # Register/update discovered recordings in database with computed priorities
+            self.db.register_recordings(discovered)
 
-        # Get pending downloads sorted chronologically oldest-first
-        pending = self.db.get_pending_downloads()
+            # Get pending downloads sorted by priority ASC (0=Event, 1=Normal, ...), timestamp ASC
+            pending = self.db.get_pending_downloads()
 
-        if not pending:
-            logger.info("All discovered videos have already been downloaded.")
-            return
+            if not pending:
+                logger.info("All discovered videos have already been downloaded.")
+                return
 
-        logger.info(f"Found {len(pending)} pending videos to download from dashcam.")
+            # Select highest-priority eligible & stable file
+            target_rec = None
+            for rec in pending:
+                recording_dict = dict(rec)
+                if self.is_remote_file_stable(recording_dict):
+                    target_rec = recording_dict
+                    break
+                else:
+                    logger.info(
+                        f"File '{recording_dict['filename']}' (Priority {recording_dict.get('priority')}) "
+                        f"is currently being written/unstable. Skipping for next eligible file."
+                    )
 
-        oldest_pending = pending[0]
-        logger.info(f"Oldest pending recording: {oldest_pending['filename']} (Timestamp: {oldest_pending['recording_timestamp']})")
+            if not target_rec:
+                logger.info("No eligible stable files ready for download in this cycle.")
+                return
 
-        for rec in pending:
-            recording_dict = dict(rec)
-            expected_size = recording_dict.get("file_size", 0)
+            expected_size = target_rec.get("file_size", 0)
 
             # Check buffer and disk space constraints
             can_download, reason = self.check_storage_limits(expected_size)
             if not can_download:
-                break
+                logger.warning(f"Storage limit reached ({reason}). Pausing download cycle.")
+                return
 
-            success = self.download_file(recording_dict)
+            success = self.download_file(target_rec)
             if not success:
-                logger.warning(f"Stopping current sync cycle due to download error on '{recording_dict['filename']}'.")
-                break
+                logger.warning(f"Stopping current sync cycle due to download error on '{target_rec['filename']}'.")
+                return
 
             current_buf_gb = self.get_current_local_buffer_size() / (1024 ** 3)
             max_buf_gb = self.config.MAX_BUFFER_BYTES / (1024 ** 3)
@@ -281,5 +410,5 @@ class VantrueSyncEngine:
                 try:
                     on_file_downloaded()
                 except Exception as cb_exc:
-                    logger.error(f"Callback error after downloading '{recording_dict['filename']}': {cb_exc}")
+                    logger.error(f"Callback error after downloading '{target_rec['filename']}': {cb_exc}")
 

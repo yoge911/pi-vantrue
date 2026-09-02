@@ -36,6 +36,7 @@ class SyncDB:
                         filename TEXT NOT NULL,
                         file_size INTEGER DEFAULT 0,
                         recording_timestamp TEXT,
+                        priority INTEGER DEFAULT 4,
                         status TEXT NOT NULL CHECK(status IN ('discovered', 'downloaded', 'uploaded', 'deleted')),
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -54,30 +55,24 @@ class SyncDB:
                     ON recordings(recording_timestamp);
                     """
                 )
-                cursor.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS preservation_requests (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        request_id TEXT UNIQUE NOT NULL,
-                        from_time TEXT NOT NULL,
-                        to_time TEXT NOT NULL,
-                        status TEXT NOT NULL DEFAULT 'pending',
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    );
-                    """
-                )
-                cursor.execute(
-                    """
-                    CREATE INDEX IF NOT EXISTS idx_preservation_status
-                    ON preservation_requests(status);
-                    """
-                )
                 # Automatic idempotent schema migration for uploaded_at timestamp
                 try:
                     cursor.execute("ALTER TABLE recordings ADD COLUMN uploaded_at TIMESTAMP;")
                 except Exception:
                     pass
+
+                # Automatic idempotent schema migration for priority column
+                try:
+                    cursor.execute("ALTER TABLE recordings ADD COLUMN priority INTEGER DEFAULT 4;")
+                except Exception:
+                    pass
+
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_recordings_priority_ts
+                    ON recordings(priority, recording_timestamp, filename);
+                    """
+                )
 
                 conn.commit()
         except sqlite3.OperationalError:
@@ -111,8 +106,8 @@ class SyncDB:
                             dummy_url = f"local://{fn}"
                             cursor.execute(
                                 """
-                                INSERT INTO recordings (remote_url, filename, file_size, recording_timestamp, status)
-                                VALUES (?, ?, ?, ?, 'downloaded')
+                                INSERT INTO recordings (remote_url, filename, file_size, recording_timestamp, priority, status)
+                                VALUES (?, ?, ?, ?, 4, 'downloaded')
                                 ON CONFLICT(remote_url) DO UPDATE SET status = 'downloaded', file_size = EXCLUDED.file_size;
                                 """,
                                 (dummy_url, fn, size, fn),
@@ -123,37 +118,39 @@ class SyncDB:
 
 
     def register_recordings(self, recordings: List[Dict]):
-        """Register newly discovered recordings into database."""
+        """Register newly discovered recordings into database with computed priority."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
             for rec in recordings:
                 cursor.execute(
                     """
                     INSERT INTO recordings (
-                        remote_url, filename, file_size, recording_timestamp, status
-                    ) VALUES (?, ?, ?, ?, 'discovered')
+                        remote_url, filename, file_size, recording_timestamp, priority, status
+                    ) VALUES (?, ?, ?, ?, ?, 'discovered')
                     ON CONFLICT(remote_url) DO UPDATE SET
                         file_size = COALESCE(EXCLUDED.file_size, recordings.file_size),
-                        recording_timestamp = COALESCE(EXCLUDED.recording_timestamp, recordings.recording_timestamp)
+                        recording_timestamp = COALESCE(EXCLUDED.recording_timestamp, recordings.recording_timestamp),
+                        priority = EXCLUDED.priority;
                     """,
                     (
                         rec["remote_url"],
                         rec["filename"],
                         rec.get("file_size", 0),
                         rec.get("recording_timestamp", ""),
+                        rec.get("priority", 4),
                     ),
                 )
             conn.commit()
 
     def get_pending_downloads(self) -> List[sqlite3.Row]:
-        """Fetch discovered recordings sorted chronologically oldest-first."""
+        """Fetch discovered recordings sorted by priority (highest priority first) and timestamp (oldest first)."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
                 """
                 SELECT * FROM recordings
                 WHERE status = 'discovered'
-                ORDER BY recording_timestamp ASC, filename ASC;
+                ORDER BY priority ASC, recording_timestamp ASC, filename ASC;
                 """
             )
             return cursor.fetchall()
