@@ -136,6 +136,8 @@ class VantrueWebHandler(BaseHTTPRequestHandler):
 
         if path == "/api/cleanup":
             self._handle_api_cleanup()
+        elif path == "/api/rescan":
+            self._handle_api_rescan()
         else:
             self.send_error(HTTPStatus.NOT_FOUND, "Endpoint not found")
 
@@ -169,6 +171,12 @@ class VantrueWebHandler(BaseHTTPRequestHandler):
                 "free_gb": round(free_b / (1024 ** 3), 2),
                 "min_free_space_gb": Config.MIN_FREE_SPACE_GB,
                 "percent_used": round((used_b / total_b * 100), 1) if total_b else 0,
+            },
+            "queue": {
+                "pending_download_count": stats.get("pending_download_count", 0),
+                "pending_event_count": stats.get("pending_event_count", 0),
+                "pending_normal_count": stats.get("pending_normal_count", 0),
+                "pending_upload_count": stats.get("pending_upload_count", 0),
             },
             "videos": {
                 "local_count": stats["local_count"],
@@ -248,6 +256,17 @@ class VantrueWebHandler(BaseHTTPRequestHandler):
                 "min_free_space_gb": Config.MIN_FREE_SPACE_GB,
             },
         )
+
+    def _handle_api_rescan(self):
+        logger.info("Manual remote rescan requested via Web API.")
+        try:
+            from vantrue_sync import VantrueSyncEngine
+            engine = VantrueSyncEngine(Config)
+            engine.run_sync(force_rescan=True)
+            self._send_json(HTTPStatus.OK, {"status": "success", "message": "Discovery rescan completed."})
+        except Exception as exc:
+            logger.error(f"Manual rescan error: {exc}")
+            self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"status": "error", "message": str(exc)})
 
     def _handle_stream_video(self, filename: str):
         """
@@ -502,6 +521,23 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </div>
 
     <div class="card">
+        <div class="card-title">Download Queue & Discovery</div>
+        <div class="status-grid">
+            <div class="stat-box">
+                <div class="stat-label">Pending Downloads</div>
+                <div id="queue-pending" class="stat-value">...</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-label">Pending Breakdown</div>
+                <div id="queue-breakdown" class="stat-value">...</div>
+            </div>
+        </div>
+        <div style="display:flex; justify-content:flex-end; margin-top:12px;">
+            <button class="filter-btn" onclick="triggerRescan()">Force Rescan</button>
+        </div>
+    </div>
+
+    <div class="card">
         <div class="card-title">Network & System Status</div>
         <div class="status-grid">
             <div class="stat-box">
@@ -538,6 +574,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     `<b>${s.used_gb} GB</b> used of <b>${s.total_gb} GB</b> (${s.free_gb} GB free, Min reserve: ${s.min_free_space_gb} GB)`;
                 document.getElementById('storage-bar').style.width = s.percent_used + '%';
 
+                const q = data.queue || {};
+                document.getElementById('queue-pending').innerHTML = 
+                    `<b>${q.pending_download_count || 0}</b> files`;
+                document.getElementById('queue-breakdown').innerHTML = 
+                    `<span class="pill pill-warn">${q.pending_event_count || 0} Event</span> <span class="pill">${q.pending_normal_count || 0} Normal</span>`;
+
                 const w0 = data.network.wlan0;
                 document.getElementById('net-wlan0').innerHTML = 
                     `${w0.ip} <span class="pill ${w0.dashcam_reachable ? 'pill-green':'pill-warn'}">${w0.dashcam_reachable ? 'Dashcam Reachable':'Idle'}</span>`;
@@ -546,6 +588,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 document.getElementById('net-wlan1').innerHTML = 
                     `${w1.ip} <span class="pill ${w1.internet_reachable ? 'pill-green':'pill-warn'}">${w1.internet_reachable ? 'Internet OK':'Local Only'}</span>`;
             } catch(e) { console.error('Status error:', e); }
+        }
+
+        async function triggerRescan() {
+            if (!confirm('Trigger a full remote camera discovery scan?')) return;
+            try {
+                const res = await fetch('/api/rescan', { method: 'POST' });
+                const data = await res.json();
+                alert(data.message || 'Rescan triggered.');
+                loadAll();
+            } catch(e) { alert('Rescan error: ' + e); }
         }
 
         async function loadVideos() {

@@ -131,6 +131,17 @@ class VantrueSyncEngine:
         self.config = config
         self.db = SyncDB(self.config.DB_PATH)
         self.config.LOCAL_DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        self.last_discovery_time: float = 0.0
+        self.is_discovery_running: bool = False
+
+    def check_camera_endpoint_quick(self) -> bool:
+        """Quick HTTP GET probe to verify camera endpoint is reachable before querying SQLite work."""
+        try:
+            req = urllib.request.Request(self.config.VANTRUE_BASE_URL, headers={"User-Agent": "VantruePiAutomation/1.0"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return resp.status == 200
+        except Exception:
+            return False
 
     def get_remote_file_size(self, remote_url: str) -> int:
         """Perform a HEAD request to observe remote file size in bytes."""
@@ -348,30 +359,60 @@ class VantrueSyncEngine:
                 part_path.unlink(missing_ok=True)
             return False
 
-    def run_sync(self, on_file_downloaded: Optional[Callable[[], None]] = None):
-        """Execute full video discovery, ordering, stability verification, and download loop."""
+    def run_sync(self, on_file_downloaded: Optional[Callable[[], None]] = None, force_rescan: bool = False):
+        """
+        Execute decoupled sync workflow:
+          1. Check SQLite for pending downloads (ordered Newest-First).
+          2. If pending items exist and discovery timer is active (and not force_rescan):
+             Verify camera endpoint reachability -> Process SQLite pending items directly.
+          3. If pending queue is empty or discovery timer elapsed (or force_rescan):
+             Execute scan_remote_recordings() to discover newly generated recordings.
+        """
+        consecutive_404_count = 0
+
         while True:
-            try:
-                discovered = self.scan_remote_recordings()
-            except Exception as exc:
-                logger.info(f"Vantrue HTTP endpoint unreachable: {exc}. Will retry in next cycle.")
-                return
-
-            if not discovered:
-                logger.info("No video files found on Vantrue HTTP server.")
-                return
-
-            # Register/update discovered recordings in database with computed priorities
-            self.db.register_recordings(discovered)
-
-            # Get pending downloads sorted by priority ASC (0=Event, 1=Normal, ...), timestamp ASC
             pending = self.db.get_pending_downloads()
 
+            now = time.time()
+            interval = getattr(self.config, "DASHCAM_DISCOVERY_INTERVAL", 180.0)
+            time_since_discovery = now - self.last_discovery_time
+
+            need_discovery = (
+                force_rescan
+                or self.last_discovery_time == 0.0
+                or time_since_discovery >= interval
+                or not pending
+                or consecutive_404_count >= 2
+            )
+
+            if need_discovery:
+                logger.info("Executing remote file discovery scan...")
+                self.is_discovery_running = True
+                try:
+                    discovered = self.scan_remote_recordings()
+                    self.last_discovery_time = time.time()
+                    force_rescan = False
+                    consecutive_404_count = 0
+                except Exception as exc:
+                    self.is_discovery_running = False
+                    logger.info(f"Vantrue HTTP endpoint unreachable: {exc}. Will retry in next cycle.")
+                    return
+                finally:
+                    self.is_discovery_running = False
+
+                if discovered:
+                    self.db.register_recordings(discovered)
+
+                pending = self.db.get_pending_downloads()
+
             if not pending:
-                logger.info("All discovered videos have already been downloaded.")
+                logger.info("All discovered videos have been downloaded and queue is empty.")
                 return
 
-            # Select highest-priority eligible & stable file
+            if not self.check_camera_endpoint_quick():
+                logger.info("Vantrue HTTP endpoint unreachable. Will retry in next cycle.")
+                return
+
             target_rec = None
             for rec in pending:
                 recording_dict = dict(rec)
@@ -390,7 +431,6 @@ class VantrueSyncEngine:
 
             expected_size = target_rec.get("file_size", 0)
 
-            # Check buffer and disk space constraints
             can_download, reason = self.check_storage_limits(expected_size)
             if not can_download:
                 logger.warning(f"Storage limit reached ({reason}). Pausing download cycle.")
@@ -405,7 +445,6 @@ class VantrueSyncEngine:
             max_buf_gb = self.config.MAX_BUFFER_BYTES / (1024 ** 3)
             storage_logger.info(f"Local buffer: {current_buf_gb:.2f} GB / {max_buf_gb:.2f} GB")
 
-            # Invoke callback immediately after each file download completes
             if on_file_downloaded:
                 try:
                     on_file_downloaded()

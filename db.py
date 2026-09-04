@@ -143,14 +143,14 @@ class SyncDB:
             conn.commit()
 
     def get_pending_downloads(self) -> List[sqlite3.Row]:
-        """Fetch discovered recordings sorted by priority (highest priority first) and timestamp (oldest first)."""
+        """Fetch discovered recordings sorted by priority ASC (Event 0 before Normal 1) and timestamp DESC (NEWEST FIRST)."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
                 """
                 SELECT * FROM recordings
                 WHERE status = 'discovered'
-                ORDER BY priority ASC, recording_timestamp ASC, filename ASC;
+                ORDER BY priority ASC, recording_timestamp DESC, filename DESC;
                 """
             )
             return cursor.fetchall()
@@ -267,13 +267,16 @@ class SyncDB:
             conn.commit()
 
     def get_stats(self) -> Dict:
-        """Get summary statistics for dashboard display."""
+        """Get summary statistics for dashboard display including discovery and queue metrics."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
                 """
                 SELECT
                     COUNT(*) as total_discovered,
+                    SUM(CASE WHEN status = 'discovered' THEN 1 ELSE 0 END) as pending_download_count,
+                    SUM(CASE WHEN status = 'discovered' AND priority = 0 THEN 1 ELSE 0 END) as pending_event_count,
+                    SUM(CASE WHEN status = 'discovered' AND priority = 1 THEN 1 ELSE 0 END) as pending_normal_count,
                     SUM(CASE WHEN status = 'downloaded' THEN 1 ELSE 0 END) as pending_upload_count,
                     SUM(CASE WHEN status = 'uploaded' THEN 1 ELSE 0 END) as uploaded_count,
                     SUM(CASE WHEN status in ('downloaded', 'uploaded') THEN 1 ELSE 0 END) as local_count,
@@ -285,6 +288,9 @@ class SyncDB:
             row = cursor.fetchone()
             return {
                 "total_discovered": row["total_discovered"] or 0,
+                "pending_download_count": row["pending_download_count"] or 0,
+                "pending_event_count": row["pending_event_count"] or 0,
+                "pending_normal_count": row["pending_normal_count"] or 0,
                 "pending_upload_count": row["pending_upload_count"] or 0,
                 "uploaded_count": row["uploaded_count"] or 0,
                 "local_count": row["local_count"] or 0,

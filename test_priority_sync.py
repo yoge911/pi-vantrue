@@ -85,8 +85,8 @@ class TestPrioritySync(unittest.TestCase):
         pending = self.db.get_pending_downloads()
 
         pending_filenames = [r["filename"] for r in pending]
-        # Expected order: event_001.mp4 (Priority 0), normal_001.mp4 (Priority 1, 10:00), normal_002.mp4 (Priority 1, 10:05), gps_001.dat (Priority 2)
-        expected = ["event_001.mp4", "normal_001.mp4", "normal_002.mp4", "gps_001.dat"]
+        # Expected order: event_001.mp4 (Priority 0), normal_002.mp4 (Priority 1, 10:05 - NEWEST FIRST), normal_001.mp4 (Priority 1, 10:00), gps_001.dat (Priority 2)
+        expected = ["event_001.mp4", "normal_002.mp4", "normal_001.mp4", "gps_001.dat"]
         self.assertEqual(pending_filenames, expected)
 
     def test_database_priority_update_on_rediscovery(self):
@@ -194,20 +194,20 @@ class TestPrioritySync(unittest.TestCase):
             engine.db.register_recordings(discovered)
             pending = engine.db.get_pending_downloads()
 
-            # Assert initial queue priority order: Event first, then Normal 1, then Normal 2
+            # Assert initial queue priority order: Event first, then Normal 2 (10:02 - newest), then Normal 1 (10:01)
             self.assertEqual(pending[0]["filename"], "20260822_100000_0001_E.MP4")
-            self.assertEqual(pending[1]["filename"], "20260822_100100_0001_N.MP4")
-            self.assertEqual(pending[2]["filename"], "20260822_100200_0002_N.MP4")
+            self.assertEqual(pending[1]["filename"], "20260822_100200_0002_N.MP4")
+            self.assertEqual(pending[2]["filename"], "20260822_100100_0001_N.MP4")
 
             # STEP 2: Download Event 1
             success_evt1 = engine.download_file(dict(pending[0]))
             self.assertTrue(success_evt1)
             self.assertTrue((self.video_dir / "20260822_100000_0001_E.MP4").exists())
 
-            # STEP 3: Download Normal 1
-            success_norm1 = engine.download_file(dict(pending[1]))
-            self.assertTrue(success_norm1)
-            self.assertTrue((self.video_dir / "20260822_100100_0001_N.MP4").exists())
+            # STEP 3: Download Normal 2 (newest normal file at pending[1])
+            success_norm2 = engine.download_file(dict(pending[1]))
+            self.assertTrue(success_norm2)
+            self.assertTrue((self.video_dir / "20260822_100200_0002_N.MP4").exists())
 
             # STEP 4: Camera disconnects
             camera_online = False
@@ -229,8 +229,8 @@ class TestPrioritySync(unittest.TestCase):
             # STEP 7: Assertions
             # 1. New Event file was discovered and downloaded
             self.assertTrue((self.video_dir / "20260822_100300_0002_E.MP4").exists())
-            # 2. Remaining Normal 2 file was downloaded
-            self.assertTrue((self.video_dir / "20260822_100200_0002_N.MP4").exists())
+            # 2. Remaining Normal 1 file was downloaded
+            self.assertTrue((self.video_dir / "20260822_100100_0001_N.MP4").exists())
 
             # 3. Verify no .part temporary files remain
             part_files = list(self.video_dir.glob("*.part"))

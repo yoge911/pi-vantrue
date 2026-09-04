@@ -67,6 +67,12 @@ class Config:
     # Delay in seconds between file size observations for stability verification
     STABILITY_CHECK_DELAY = float(os.environ.get("STABILITY_CHECK_DELAY", "2.0"))
 
+    # Discovery interval in seconds (Default: 180s / 3 minutes between full remote scans)
+    DASHCAM_DISCOVERY_INTERVAL = float(os.environ.get("DASHCAM_DISCOVERY_INTERVAL", "180.0"))
+
+    # Optional maximum recording age threshold in hours (0 = disabled/unlimited)
+    DOWNLOAD_MAX_AGE_HOURS = float(os.environ.get("DOWNLOAD_MAX_AGE_HOURS", "0.0"))
+
     # Supported file extensions (videos, photos, GPS/log metadata)
     SUPPORTED_EXTENSIONS = (
         ".mp4",
