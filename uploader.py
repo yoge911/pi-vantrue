@@ -8,6 +8,7 @@ from typing import Callable, Dict, List, Optional
 
 from config import Config
 from db import SyncDB
+from transfer_state import set_transfer_in_progress
 
 logger = logging.getLogger("upload")
 
@@ -70,6 +71,7 @@ class VantrueUploader:
         ]
 
         start_time = time.time()
+        set_transfer_in_progress(True)
         try:
             result = subprocess.run(
                 cmd,
@@ -88,6 +90,8 @@ class VantrueUploader:
                 f"Failed to execute rclone for '{filename}': {exc}. Local copy preserved."
             )
             return False
+        finally:
+            set_transfer_in_progress(False)
 
         duration = time.time() - start_time
         if result.returncode == 0:

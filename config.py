@@ -12,6 +12,12 @@ class Config:
     VANTRUE_NETWORK = os.environ.get("VANTRUE_NETWORK", "E3_VANTRUE_13c6")
     IPHONE_NETWORK = os.environ.get("IPHONE_NETWORK", "iPhone 1")
 
+    # wlan1 Hotspot Selection Settings
+    PREFERRED_HOTSPOT_SSID = os.environ.get("PREFERRED_HOTSPOT_SSID", "Vantrue-iPhone-Hotspot")
+    FALLBACK_HOTSPOT_SSID = os.environ.get("FALLBACK_HOTSPOT_SSID", IPHONE_NETWORK)
+    HOTSPOT_PRIORITY = [PREFERRED_HOTSPOT_SSID, FALLBACK_HOTSPOT_SSID]
+    HOTSPOT_RETRY_INTERVAL = int(os.environ.get("HOTSPOT_RETRY_INTERVAL", 15))
+
     # Logging Configuration
     LOG_DIR = Path(
         os.environ.get(

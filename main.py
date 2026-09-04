@@ -9,7 +9,9 @@ from logger import setup_logging
 from uploader import VantrueUploader
 from vantrue_sync import VantrueSyncEngine
 
-RETRY_CYCLE_SECONDS = 30
+from transfer_state import is_transfer_in_progress
+
+RETRY_CYCLE_SECONDS = Config.HOTSPOT_RETRY_INTERVAL
 
 
 def check_interface_exists(interface: str) -> bool:
@@ -149,12 +151,94 @@ def connect(
     return False
 
 
+def ensure_internet_connection_wlan1(uploader: Optional[VantrueUploader] = None) -> bool:
+    """
+    Ensure wlan1 has a healthy internet connection, managing priority hotspot selection:
+      1. Preferred: Config.PREFERRED_HOTSPOT_SSID ("Vantrue-iPhone-Hotspot")
+      2. Fallback: Config.FALLBACK_HOTSPOT_SSID (regular iPhone e.g. "iPhone 1")
+
+    Retries every Config.HOTSPOT_RETRY_INTERVAL (15s) when internet is down.
+    Never interrupts an active file transfer.
+    """
+    logger = logging.getLogger(f"network.{Config.INTERNET_INTERFACE}")
+    uploader_instance = uploader or VantrueUploader()
+
+    if not check_interface_exists(Config.INTERNET_INTERFACE):
+        logger.warning(f"Internet interface '{Config.INTERNET_INTERFACE}' is absent on system.")
+        return False
+
+    logger.info("wlan1: checking internet connectivity")
+    has_internet = uploader_instance.check_internet_connectivity()
+    active_conn = get_active_wifi_connection(Config.INTERNET_INTERFACE)
+
+    pref_ssid = Config.PREFERRED_HOTSPOT_SSID
+    fallback_ssid = Config.FALLBACK_HOTSPOT_SSID
+
+    # CASE 1: Internet is working
+    if has_internet:
+        if active_conn == pref_ssid:
+            logger.info(f"wlan1: internet connection established via {pref_ssid}")
+            return True
+        elif active_conn == fallback_ssid:
+            if is_transfer_in_progress():
+                logger.info("wlan1: active transfer in progress; skipping preferred hotspot check for now")
+                return True
+
+            if is_ssid_visible(pref_ssid, interface=Config.INTERNET_INTERFACE, rescan=True):
+                logger.info(f"wlan1: preferred hotspot {pref_ssid} became available; switching from fallback")
+                if connect(pref_ssid, interface=Config.INTERNET_INTERFACE, check_visibility=False):
+                    if uploader_instance.check_internet_connectivity():
+                        logger.info(f"wlan1: internet connection established via {pref_ssid}")
+                        return True
+                    else:
+                        logger.warning(f"wlan1: preferred hotspot connection failed (no internet access); reverting to fallback")
+                        connect(fallback_ssid, interface=Config.INTERNET_INTERFACE, check_visibility=False)
+            return True
+        else:
+            logger.info(f"wlan1: internet connection established via {active_conn or 'existing connection'}")
+            return True
+
+    # CASE 2: Connection lost or internet check failed -> Start Hotspot Recovery
+    logger.info("wlan1: connection lost, starting hotspot recovery")
+    logger.info(f"wlan1: scanning for preferred hotspot {pref_ssid}")
+
+    pref_visible = is_ssid_visible(pref_ssid, interface=Config.INTERNET_INTERFACE, rescan=True)
+
+    if pref_visible:
+        logger.info(f"wlan1: trying preferred hotspot {pref_ssid}")
+        if connect(pref_ssid, interface=Config.INTERNET_INTERFACE, check_visibility=False):
+            if uploader_instance.check_internet_connectivity():
+                logger.info(f"wlan1: internet connection established via {pref_ssid}")
+                return True
+            else:
+                logger.warning("wlan1: preferred hotspot connection failed")
+        else:
+            logger.warning("wlan1: preferred hotspot connection failed")
+    else:
+        logger.info("wlan1: preferred hotspot unavailable")
+
+    fallback_visible = is_ssid_visible(fallback_ssid, interface=Config.INTERNET_INTERFACE, rescan=False)
+    if fallback_visible:
+        logger.info("wlan1: trying fallback iPhone hotspot")
+        if connect(fallback_ssid, interface=Config.INTERNET_INTERFACE, check_visibility=False):
+            if uploader_instance.check_internet_connectivity():
+                logger.info(f"wlan1: internet connection established via {fallback_ssid}")
+                return True
+            else:
+                logger.warning("wlan1: fallback hotspot connection failed")
+    else:
+        logger.info(f"wlan1: fallback hotspot '{fallback_ssid}' unavailable")
+
+    logger.info(f"wlan1: no hotspot connection available, retrying in {Config.HOTSPOT_RETRY_INTERVAL} seconds")
+    return False
+
+
 def run_vantrue_sync():
     """
     Vantrue synchronization workflow:
       1. Query Vantrue HTTP directory listing
       2. Store discovered files in SQLite database
-      3. Process pending videos in oldest-first chronological order
+      3. Process pending videos in newest-first chronological order
       4. Verify local buffer & free space safety limits
       5. Atomically download to .part file and rename to .mp4 upon completion
     """
@@ -178,11 +262,11 @@ def run_upload_cycle():
         uploader = VantrueUploader()
 
         def connect_internet_fn(net_name: str) -> bool:
-            return connect(net_name, interface=Config.INTERNET_INTERFACE, check_visibility=True)
+            return ensure_internet_connection_wlan1(uploader=uploader)
 
         uploader.run_upload_cycle(
             connect_wifi_fn=connect_internet_fn,
-            iphone_network_name=Config.IPHONE_NETWORK,
+            iphone_network_name=Config.PREFERRED_HOTSPOT_SSID,
         )
     except Exception as exc:
         logger.error(f"Error during upload cycle: {exc}", exc_info=True)
@@ -235,7 +319,8 @@ def network_cycle():
 
     if pending_uploads:
         logger.info(f"{len(pending_uploads)} recordings pending upload. Triggering upload check...")
-        run_upload_cycle()
+        if ensure_internet_connection_wlan1(uploader=uploader):
+            run_upload_cycle()
 
 
 def main():

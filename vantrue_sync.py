@@ -13,6 +13,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 from config import Config
 from db import SyncDB
 from retention import RetentionManager
+from transfer_state import set_transfer_in_progress
 
 logger = logging.getLogger("sync")
 storage_logger = logging.getLogger("storage")
@@ -320,9 +321,10 @@ class VantrueSyncEngine:
         logger.info(f"Download started file={filename} url={remote_url} dest={final_path}")
         start_time = time.time()
 
-        req = urllib.request.Request(remote_url, headers={"User-Agent": "VantruePiAutomation/1.0"})
-
+        set_transfer_in_progress(True)
         try:
+            req = urllib.request.Request(remote_url, headers={"User-Agent": "VantruePiAutomation/1.0"})
+
             with urllib.request.urlopen(req, timeout=self.config.HTTP_TIMEOUT) as response:
                 if response.status != 200:
                     logger.error(f"HTTP error {response.status} downloading '{filename}'.")
@@ -358,6 +360,8 @@ class VantrueSyncEngine:
             if part_path.exists():
                 part_path.unlink(missing_ok=True)
             return False
+        finally:
+            set_transfer_in_progress(False)
 
     def run_sync(self, on_file_downloaded: Optional[Callable[[], None]] = None, force_rescan: bool = False):
         """
