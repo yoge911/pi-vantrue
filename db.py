@@ -67,6 +67,12 @@ class SyncDB:
                 except Exception:
                     pass
 
+                # Automatic idempotent schema migration for drive_file_id column
+                try:
+                    cursor.execute("ALTER TABLE recordings ADD COLUMN drive_file_id TEXT;")
+                except Exception:
+                    pass
+
                 cursor.execute(
                     """
                     CREATE INDEX IF NOT EXISTS idx_recordings_priority_ts
@@ -235,8 +241,8 @@ class SyncDB:
                 )
             return cursor.fetchall()
 
-    def mark_uploaded(self, remote_url: str):
-        """Mark a recording as successfully uploaded to cloud storage."""
+    def mark_uploaded(self, remote_url: str, drive_file_id: Optional[str] = None):
+        """Mark a recording as successfully uploaded to cloud storage with optional Drive file ID."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
@@ -244,12 +250,44 @@ class SyncDB:
                 UPDATE recordings
                 SET status = 'uploaded',
                     uploaded_at = CURRENT_TIMESTAMP,
+                    drive_file_id = COALESCE(?, drive_file_id),
                     updated_at = CURRENT_TIMESTAMP
                 WHERE remote_url = ?;
                 """,
-                (remote_url,),
+                (drive_file_id, remote_url),
             )
             conn.commit()
+
+    def update_drive_file_id(self, remote_url: str, drive_file_id: str):
+        """Update or persist Google Drive file ID for a cloud-synced recording."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE recordings
+                SET drive_file_id = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE remote_url = ?;
+                """,
+                (drive_file_id, remote_url),
+            )
+            conn.commit()
+
+    def get_recordings_missing_drive_id(self, limit: int = 3) -> List[sqlite3.Row]:
+        """Fetch historical cloud-synced (uploaded/deleted) recordings missing a Google Drive file ID for throttled backfill."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT * FROM recordings
+                WHERE status IN ('uploaded', 'deleted')
+                  AND (drive_file_id IS NULL OR drive_file_id = '')
+                ORDER BY recording_timestamp DESC
+                LIMIT ?;
+                """,
+                (limit,),
+            )
+            return cursor.fetchall()
 
     def mark_deleted(self, remote_url: str):
         """Mark a recording as deleted locally after confirmed cloud upload."""

@@ -222,6 +222,9 @@ class VantrueWebHandler(BaseHTTPRequestHandler):
             local_path = base_dir / fn
             is_present = local_path.exists() and local_path.is_file()
 
+            drive_id = r["drive_file_id"] if ("drive_file_id" in r.keys() and r["drive_file_id"]) else None
+            cloud_play_url = f"https://drive.google.com/file/d/{drive_id}/view" if drive_id else None
+
             cat_info = categorize_filename(fn)
             video_list.append(
                 {
@@ -231,6 +234,8 @@ class VantrueWebHandler(BaseHTTPRequestHandler):
                     "file_size_mb": round(r["file_size"] / (1024 * 1024), 1),
                     "status": r["status"],
                     "uploaded_at": r["uploaded_at"] if "uploaded_at" in r.keys() else None,
+                    "drive_file_id": drive_id,
+                    "cloud_play_url": cloud_play_url,
                     "local_present": is_present,
                     "category": cat_info["label"],
                     "category_type": cat_info["type"],
@@ -273,33 +278,30 @@ class VantrueWebHandler(BaseHTTPRequestHandler):
         Stream local MP4 video file supporting HTTP Byte-Range requests for iOS Safari / Chrome seeking.
         Includes strict path traversal security checks.
         """
-        # Strict Path Traversal Guard
         base_dir = Config.LOCAL_DOWNLOAD_DIR.resolve()
         target_path = (base_dir / filename).resolve()
 
-        if not str(target_path).startswith(str(base_dir)):
-            logger.warning(f"Security Alert: Path traversal attempt blocked for '{filename}'.")
-            self.send_error(HTTPStatus.FORBIDDEN, "Access denied")
-            return
-
-        if not target_path.exists() or not target_path.is_file():
-            self.send_error(HTTPStatus.NOT_FOUND, "File not found")
+        if not target_path.exists() or not target_path.is_file() or base_dir not in target_path.parents:
+            self.send_error(HTTPStatus.NOT_FOUND, "Video file not found")
             return
 
         file_size = target_path.stat().st_size
-        content_type = "video/mp4"
-        if filename.lower().endswith(".mov"):
-            content_type = "video/quicktime"
-
         range_header = self.headers.get("Range")
 
-        if range_header and range_header.startswith("bytes="):
-            # Parse Range Header (e.g. bytes=1000-2000 or bytes=1000-)
+        content_type = "video/mp4"
+        fn_lower = filename.lower()
+        if fn_lower.endswith((".jpg", ".jpeg")):
+            content_type = "image/jpeg"
+        elif fn_lower.endswith(".png"):
+            content_type = "image/png"
+        elif fn_lower.endswith((".gps", ".dat", ".log", ".txt")):
+            content_type = "text/plain"
+
+        if range_header:
             try:
-                byte_range = range_header.split("=")[1].strip()
-                parts = byte_range.split("-")
-                start_byte = int(parts[0]) if parts[0] else 0
-                end_byte = int(parts[1]) if parts[1] else file_size - 1
+                byte_range = range_header.replace("bytes=", "").split("-")
+                start_byte = int(byte_range[0])
+                end_byte = int(byte_range[1]) if byte_range[1] else file_size - 1
 
                 if start_byte >= file_size or end_byte >= file_size or start_byte > end_byte:
                     self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
@@ -307,33 +309,31 @@ class VantrueWebHandler(BaseHTTPRequestHandler):
                     self.end_headers()
                     return
 
-                chunk_length = end_byte - start_byte + 1
-
+                chunk_len = end_byte - start_byte + 1
                 self.send_response(HTTPStatus.PARTIAL_CONTENT)
                 self.send_header("Content-Type", content_type)
                 self.send_header("Accept-Ranges", "bytes")
                 self.send_header("Content-Range", f"bytes {start_byte}-{end_byte}/{file_size}")
-                self.send_header("Content-Length", str(chunk_length))
+                self.send_header("Content-Length", str(chunk_len))
                 self.end_headers()
 
                 with open(target_path, "rb") as f:
                     f.seek(start_byte)
-                    remaining = chunk_length
+                    bytes_remaining = chunk_len
                     buffer_size = 64 * 1024
-                    while remaining > 0:
-                        read_bytes = min(buffer_size, remaining)
-                        data = f.read(read_bytes)
+                    while bytes_remaining > 0:
+                        read_size = min(buffer_size, bytes_remaining)
+                        data = f.read(read_size)
                         if not data:
                             break
                         self.wfile.write(data)
-                        remaining -= len(data)
+                        bytes_remaining -= len(data)
                 return
 
             except (ValueError, IndexError, OSError) as exc:
                 logger.debug(f"Range parsing or socket error for '{filename}': {exc}")
                 return
 
-        # Fallback: Serve full file HTTP 200
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
         self.send_header("Accept-Ranges", "bytes")
@@ -372,7 +372,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         }
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
             background-color: var(--bg-color);
             color: var(--text-color);
             padding: 16px;
@@ -413,10 +413,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         }
         .progress-bar-bg {
             background: #0f172a;
+            border-radius: 8px;
             height: 12px;
-            border-radius: 6px;
+            width: 100%;
             overflow: hidden;
-            margin: 10px 0;
+            margin-top: 8px;
         }
         .progress-bar-fill {
             background: var(--accent-color);
@@ -426,52 +427,48 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         }
         .status-grid {
             display: grid;
-            grid-template-columns: repeat(2, 1fr);
+            grid-template-columns: 1fr 1fr;
             gap: 12px;
         }
         .stat-box {
             background: #0f172a;
             padding: 12px;
             border-radius: 8px;
+            border: 1px solid var(--border-color);
         }
         .stat-label { font-size: 0.8rem; color: var(--text-muted); }
         .stat-value { font-size: 1.1rem; font-weight: bold; margin-top: 4px; }
         .pill {
             display: inline-block;
-            padding: 4px 8px;
+            padding: 2px 8px;
             border-radius: 12px;
             font-size: 0.75rem;
-            font-weight: bold;
+            font-weight: 600;
         }
-        .pill-green { background: rgba(34, 197, 94, 0.2); color: #4ade80; }
-        .pill-warn { background: rgba(234, 179, 8, 0.2); color: #fde047; }
-        .pill-alert { background: rgba(239, 68, 68, 0.2); color: #f87171; }
+        .pill-green { background: rgba(34, 197, 94, 0.2); color: var(--accent-green); }
+        .pill-warn { background: rgba(234, 179, 8, 0.2); color: var(--accent-warn); }
         
         .filter-controls {
             display: flex;
             gap: 8px;
             margin-bottom: 12px;
-            overflow-x: auto;
         }
         .filter-btn {
             background: #0f172a;
             color: var(--text-muted);
             border: 1px solid var(--border-color);
             padding: 6px 12px;
-            border-radius: 20px;
+            border-radius: 6px;
             font-size: 0.85rem;
             cursor: pointer;
-            white-space: nowrap;
         }
         .filter-btn.active {
             background: var(--accent-color);
             color: #0f172a;
+            border-color: var(--accent-color);
             font-weight: bold;
         }
         .video-item {
-            display: flex;
-            flex-direction: column;
-            gap: 8px;
             border-bottom: 1px solid var(--border-color);
             padding: 12px 0;
         }
@@ -480,19 +477,30 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             display: flex;
             justify-content: space-between;
             align-items: center;
+            margin-bottom: 4px;
         }
-        .video-title { font-size: 0.95rem; font-weight: 600; word-break: break-all; }
-        .video-meta { font-size: 0.8rem; color: var(--text-muted); display: flex; gap: 12px; }
+        .video-title { font-weight: 600; word-break: break-all; }
+        .video-meta {
+            font-size: 0.8rem;
+            color: var(--text-muted);
+            display: flex;
+            gap: 12px;
+            margin-top: 4px;
+        }
         .action-btn {
+            margin-top: 8px;
             background: var(--accent-color);
             color: #0f172a;
             border: none;
-            padding: 8px 16px;
+            padding: 6px 12px;
             border-radius: 6px;
+            font-size: 0.85rem;
             font-weight: bold;
             cursor: pointer;
-            align-self: flex-start;
-            margin-top: 4px;
+        }
+        .cloud-btn {
+            background: var(--accent-green);
+            color: #0f172a;
         }
         video {
             width: 100%;
@@ -611,22 +619,38 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     return;
                 }
 
-                container.innerHTML = data.videos.map(v => `
+                container.innerHTML = data.videos.map(v => {
+                    const isSynced = (v.status === 'uploaded' || v.status === 'deleted');
+                    const hasCloudUrl = Boolean(v.cloud_play_url);
+                    const hasLocalStream = Boolean(v.local_present && v.stream_url);
+
+                    let actionHtml = '';
+                    if (isSynced && hasCloudUrl) {
+                        actionHtml += `<a href="${v.cloud_play_url}" target="_blank" class="action-btn cloud-btn" style="text-decoration:none; display:inline-block; margin-right:6px;">☁️ Play Cloud</a>`;
+                    }
+                    if (hasLocalStream) {
+                        actionHtml += `<button class="action-btn" onclick="playVideo(this, '${v.stream_url}')">📱 Play Local</button>`;
+                    }
+                    if (!hasCloudUrl && !hasLocalStream) {
+                        actionHtml = `<span style="font-size:0.8rem; color:var(--text-muted)">Not present locally (cloud link pending)</span>`;
+                    }
+
+                    return `
                     <div class="video-item">
                         <div class="video-header">
                             <span class="video-title">${v.filename}</span>
-                            <span class="pill ${v.status === 'uploaded' ? 'pill-green':'pill-warn'}">${v.status === 'uploaded' ? 'Synced':'Waiting Upload'}</span>
+                            <span class="pill ${isSynced ? 'pill-green':'pill-warn'}">${isSynced ? 'Synced':'Waiting Upload'}</span>
                         </div>
                         <div class="video-meta">
                             <span>📅 ${v.recording_timestamp}</span>
                             <span>🏷️ ${v.category}</span>
                             <span>💾 ${v.file_size_mb} MB</span>
                         </div>
-                        ${v.stream_url ? `
-                            <button class="action-btn" onclick="playVideo(this, '${v.stream_url}')">Play Video</button>
-                        ` : '<span style="font-size:0.8rem; color:var(--accent-warn)">Not present on disk</span>'}
+                        <div style="margin-top:8px;">
+                            ${actionHtml}
+                        </div>
                     </div>
-                `).join('');
+                `}).join('');
             } catch(e) { console.error('Video load error:', e); }
         }
 
@@ -634,7 +658,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             const parent = btn.parentElement;
             if (parent.querySelector('video')) {
                 parent.querySelector('video').remove();
-                btn.innerText = 'Play Video';
+                btn.innerText = '📱 Play Local';
                 return;
             }
             const video = document.createElement('video');
@@ -643,7 +667,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             video.src = url;
             parent.appendChild(video);
             video.play();
-            btn.innerText = 'Close Player';
+            btn.innerText = 'Close Local Player';
         }
 
         function setFilter(filter, btn) {
