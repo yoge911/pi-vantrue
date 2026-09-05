@@ -216,6 +216,9 @@ class VantrueWebHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
         self.end_headers()
         self.wfile.write(body)
 
@@ -255,6 +258,9 @@ class VantrueWebHandler(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(html_content)))
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
         self.end_headers()
         self.wfile.write(html_content)
 
@@ -1096,7 +1102,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
         async function loadStatus() {
             try {
-                const res = await fetch('/api/status');
+                const res = await fetch('/api/status?_t=' + Date.now(), { cache: 'no-store' });
                 if (!res.ok) {
                     console.error('Status request failed with status:', res.status);
                     return;
@@ -1153,7 +1159,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
         async function loadVideos() {
             try {
-                const res = await fetch('/api/videos?status=all');
+                const res = await fetch('/api/videos?status=all&_t=' + Date.now(), { cache: 'no-store' });
                 if (!res.ok) {
                     console.error('Video request failed with status:', res.status);
                     const container = document.getElementById('video-list');
@@ -1435,7 +1441,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             loadVideos();
         }
 
-        window.onload = loadAll;
+        if (document.readyState === 'complete' || document.readyState === 'interactive') {
+            setTimeout(loadAll, 1);
+        } else {
+            document.addEventListener('DOMContentLoaded', loadAll);
+        }
+        window.addEventListener('load', loadAll);
     </script>
 </body>
 </html>
