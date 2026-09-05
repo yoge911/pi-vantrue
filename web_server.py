@@ -164,21 +164,20 @@ def check_internet_quick() -> bool:
             Config.INTERNET_CHECK_URL,
             headers={"User-Agent": "VantruePiAutomation/1.0"},
         )
-        with urllib.request.urlopen(req, timeout=3) as resp:
+        with urllib.request.urlopen(req, timeout=1) as resp:
             return resp.status in (200, 204)
     except Exception:
         return False
 
 
 def check_dashcam_quick() -> bool:
-    """Quick non-blocking dashcam HTTP endpoint reachability probe."""
+    """Fast non-blocking socket check for dashcam reachability."""
     try:
-        req = urllib.request.Request(
-            Config.VANTRUE_BASE_URL,
-            headers={"User-Agent": "VantruePiAutomation/1.0"},
-        )
-        with urllib.request.urlopen(req, timeout=3) as resp:
-            return resp.status == 200
+        url = urllib.parse.urlparse(Config.VANTRUE_BASE_URL)
+        host = url.hostname or "192.168.1.254"
+        port = url.port or 80
+        with socket.create_connection((host, port), timeout=0.5):
+            return True
     except Exception:
         return False
 
@@ -204,7 +203,7 @@ def categorize_filename(filename: str) -> Dict[str, str]:
 
 
 class VantrueWebHandler(BaseHTTPRequestHandler):
-    """HTTP Request Handler for Vantrue Pi Web Dashboard and Video Byte-Range Streaming."""
+    """HTTP Request Handler for Vantrue Pi Web Dashboard and Streaming Proxy."""
 
     def log_message(self, format_str: str, *args: float):
         """Override log_message for unified python logging."""
@@ -267,7 +266,6 @@ class VantrueWebHandler(BaseHTTPRequestHandler):
     def _handle_api_status(self):
         try:
             db = SyncDB(Config.DB_PATH)
-            db.sync_physical_files(Config.LOCAL_DOWNLOAD_DIR)
             stats = db.get_stats()
 
             # Storage calculations
@@ -329,7 +327,6 @@ class VantrueWebHandler(BaseHTTPRequestHandler):
             sort_order = params.get("sort", ["desc"])[0]
 
             db = SyncDB(Config.DB_PATH)
-            db.sync_physical_files(Config.LOCAL_DOWNLOAD_DIR)
             records = db.get_all_recordings(
                 filter_status=filter_status, sort_desc=(sort_order == "desc")
             )
