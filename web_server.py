@@ -259,125 +259,134 @@ class VantrueWebHandler(BaseHTTPRequestHandler):
         self.wfile.write(html_content)
 
     def _handle_api_status(self):
-        db = SyncDB(Config.DB_PATH)
-        db.sync_physical_files(Config.LOCAL_DOWNLOAD_DIR)
-        stats = db.get_stats()
+        try:
+            db = SyncDB(Config.DB_PATH)
+            db.sync_physical_files(Config.LOCAL_DOWNLOAD_DIR)
+            stats = db.get_stats()
 
-        # Storage calculations
-        total_b, used_b, free_b = 0, 0, 0
-        if Config.LOCAL_DOWNLOAD_DIR.exists():
-            usage = shutil.disk_usage(Config.LOCAL_DOWNLOAD_DIR)
-            total_b, used_b, free_b = usage.total, usage.used, usage.free
+            # Storage calculations
+            total_b, used_b, free_b = 0, 0, 0
+            if Config.LOCAL_DOWNLOAD_DIR.exists():
+                usage = shutil.disk_usage(Config.LOCAL_DOWNLOAD_DIR)
+                total_b, used_b, free_b = usage.total, usage.used, usage.free
 
-        wlan0_info = get_network_interface_info(Config.VANTRUE_INTERFACE)
-        wlan1_info = get_network_interface_info(Config.INTERNET_INTERFACE)
+            wlan0_info = get_network_interface_info(Config.VANTRUE_INTERFACE)
+            wlan1_info = get_network_interface_info(Config.INTERNET_INTERFACE)
 
-        status_data = {
-            "hostname": socket.gethostname(),
-            "storage": {
-                "total_gb": round(total_b / (1024 ** 3), 2),
-                "used_gb": round(used_b / (1024 ** 3), 2),
-                "free_gb": round(free_b / (1024 ** 3), 2),
-                "min_free_space_gb": Config.MIN_FREE_SPACE_GB,
-                "percent_used": round((used_b / total_b * 100), 1) if total_b else 0,
-            },
-            "queue": {
-                "pending_download_count": stats.get("pending_download_count", 0),
-                "pending_event_count": stats.get("pending_event_count", 0),
-                "pending_normal_count": stats.get("pending_normal_count", 0),
-                "pending_upload_count": stats.get("pending_upload_count", 0),
-            },
-            "videos": {
-                "local_count": stats["local_count"],
-                "local_size_mb": round(stats["local_size"] / (1024 * 1024), 1),
-                "uploaded_count": stats["uploaded_count"],
-                "pending_upload_count": stats["pending_upload_count"],
-                "total_discovered": stats["total_discovered"],
-            },
-            "network": {
-                "wlan0": {
-                    "interface": Config.VANTRUE_INTERFACE,
-                    "status": wlan0_info["status"],
-                    "ip": wlan0_info["ip"],
-                    "dashcam_reachable": check_dashcam_quick(),
+            status_data = {
+                "hostname": socket.gethostname(),
+                "storage": {
+                    "total_gb": round(total_b / (1024 ** 3), 2),
+                    "used_gb": round(used_b / (1024 ** 3), 2),
+                    "free_gb": round(free_b / (1024 ** 3), 2),
+                    "min_free_space_gb": Config.MIN_FREE_SPACE_GB,
+                    "percent_used": round((used_b / total_b * 100), 1) if total_b else 0,
                 },
-                "wlan1": {
-                    "interface": Config.INTERNET_INTERFACE,
-                    "status": wlan1_info["status"],
-                    "ip": wlan1_info["ip"],
-                    "internet_reachable": check_internet_quick(),
+                "queue": {
+                    "pending_download_count": stats.get("pending_download_count", 0),
+                    "pending_event_count": stats.get("pending_event_count", 0),
+                    "pending_normal_count": stats.get("pending_normal_count", 0),
+                    "pending_upload_count": stats.get("pending_upload_count", 0),
                 },
-            },
-            "last_uploaded_at": stats["last_uploaded_at"],
-        }
-        self._send_json(HTTPStatus.OK, status_data)
+                "videos": {
+                    "local_count": stats.get("local_count", 0),
+                    "local_size_mb": round((stats.get("local_size") or 0) / (1024 * 1024), 1),
+                    "uploaded_count": stats.get("uploaded_count", 0),
+                    "pending_upload_count": stats.get("pending_upload_count", 0),
+                    "total_discovered": stats.get("total_discovered", 0),
+                },
+                "network": {
+                    "wlan0": {
+                        "interface": Config.VANTRUE_INTERFACE,
+                        "status": wlan0_info.get("status", "disconnected"),
+                        "ip": wlan0_info.get("ip", "N/A"),
+                        "dashcam_reachable": check_dashcam_quick(),
+                    },
+                    "wlan1": {
+                        "interface": Config.INTERNET_INTERFACE,
+                        "status": wlan1_info.get("status", "disconnected"),
+                        "ip": wlan1_info.get("ip", "N/A"),
+                        "internet_reachable": check_internet_quick(),
+                    },
+                },
+                "last_uploaded_at": stats.get("last_uploaded_at"),
+            }
+            self._send_json(HTTPStatus.OK, status_data)
+        except Exception as exc:
+            logger.error(f"Error in _handle_api_status: {exc}", exc_info=True)
+            self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
 
     def _handle_api_videos(self, query_str: str):
-        params = urllib.parse.parse_qs(query_str)
-        filter_status = params.get("status", ["all"])[0]
-        sort_order = params.get("sort", ["desc"])[0]
+        try:
+            params = urllib.parse.parse_qs(query_str)
+            filter_status = params.get("status", ["all"])[0]
+            sort_order = params.get("sort", ["desc"])[0]
 
-        db = SyncDB(Config.DB_PATH)
-        db.sync_physical_files(Config.LOCAL_DOWNLOAD_DIR)
-        records = db.get_all_recordings(
-            filter_status=filter_status, sort_desc=(sort_order == "desc")
-        )
-
-
-        base_dir = Config.LOCAL_DOWNLOAD_DIR.resolve()
-        video_list = []
-        for r in records:
-            fn = r["filename"]
-            local_path = base_dir / fn
-            is_present = local_path.exists() and local_path.is_file()
-
-            drive_id = r["drive_file_id"] if ("drive_file_id" in r.keys() and r["drive_file_id"]) else None
-            cloud_play_url = f"https://drive.google.com/file/d/{drive_id}/view" if drive_id else None
-            cloud_embed_url = f"https://drive.google.com/file/d/{drive_id}/preview" if drive_id else None
-            cloud_direct_url = f"https://drive.google.com/uc?export=download&id={drive_id}" if drive_id else None
-
-            db_status = r["status"]
-            is_synced = db_status in ("uploaded", "deleted") or bool(drive_id)
-
-            # Explicit file state classification (dashcam, local, local+cloud, cloud, missing, purged)
-            if db_status == "discovered" and not is_present:
-                file_state = "dashcam"
-            elif is_present and is_synced:
-                file_state = "local+cloud"
-            elif is_present and not is_synced:
-                file_state = "local"
-            elif not is_present and is_synced:
-                file_state = "cloud"
-            elif not is_present and db_status == "downloaded":
-                file_state = "missing"
-            elif not is_present and db_status == "deleted" and not is_synced:
-                file_state = "purged"
-            else:
-                file_state = db_status
-
-            cat_info = categorize_filename(fn)
-            video_list.append(
-                {
-                    "filename": fn,
-                    "recording_timestamp": r["recording_timestamp"],
-                    "file_size": r["file_size"],
-                    "file_size_mb": round(r["file_size"] / (1024 * 1024), 1),
-                    "status": r["status"],
-                    "file_state": file_state,
-                    "uploaded_at": r["uploaded_at"] if "uploaded_at" in r.keys() else None,
-                    "drive_file_id": drive_id,
-                    "cloud_play_url": cloud_play_url,
-                    "cloud_embed_url": cloud_embed_url,
-                    "cloud_direct_url": cloud_direct_url,
-                    "local_present": is_present,
-                    "category": cat_info["label"],
-                    "category_type": cat_info["type"],
-                    "category_position": cat_info["position"],
-                    "stream_url": f"/stream/{urllib.parse.quote(fn)}" if is_present else None,
-                }
+            db = SyncDB(Config.DB_PATH)
+            db.sync_physical_files(Config.LOCAL_DOWNLOAD_DIR)
+            records = db.get_all_recordings(
+                filter_status=filter_status, sort_desc=(sort_order == "desc")
             )
 
-        self._send_json(HTTPStatus.OK, {"videos": video_list, "count": len(video_list)})
+            base_dir = Config.LOCAL_DOWNLOAD_DIR.resolve()
+            video_list = []
+            for r in records:
+                fn = r["filename"]
+                local_path = base_dir / fn
+                is_present = local_path.exists() and local_path.is_file()
+
+                keys = r.keys() if hasattr(r, "keys") else []
+                drive_id = r["drive_file_id"] if ("drive_file_id" in keys and r["drive_file_id"]) else None
+                cloud_play_url = f"https://drive.google.com/file/d/{drive_id}/view" if drive_id else None
+                cloud_embed_url = f"https://drive.google.com/file/d/{drive_id}/preview" if drive_id else None
+                cloud_direct_url = f"https://drive.google.com/uc?export=download&id={drive_id}" if drive_id else None
+
+                db_status = r["status"]
+                is_synced = db_status in ("uploaded", "deleted") or bool(drive_id)
+
+                # Explicit file state classification (dashcam, local, local+cloud, cloud, missing, purged)
+                if db_status == "discovered" and not is_present:
+                    file_state = "dashcam"
+                elif is_present and is_synced:
+                    file_state = "local+cloud"
+                elif is_present and not is_synced:
+                    file_state = "local"
+                elif not is_present and is_synced:
+                    file_state = "cloud"
+                elif not is_present and db_status == "downloaded":
+                    file_state = "missing"
+                elif not is_present and db_status == "deleted" and not is_synced:
+                    file_state = "purged"
+                else:
+                    file_state = db_status
+
+                cat_info = categorize_filename(fn)
+                raw_size = r["file_size"] or 0
+                video_list.append(
+                    {
+                        "filename": fn,
+                        "recording_timestamp": r["recording_timestamp"] if "recording_timestamp" in keys else fn,
+                        "file_size": raw_size,
+                        "file_size_mb": round(raw_size / (1024 * 1024), 1),
+                        "status": db_status,
+                        "file_state": file_state,
+                        "uploaded_at": r["uploaded_at"] if ("uploaded_at" in keys and r["uploaded_at"]) else None,
+                        "drive_file_id": drive_id,
+                        "cloud_play_url": cloud_play_url,
+                        "cloud_embed_url": cloud_embed_url,
+                        "cloud_direct_url": cloud_direct_url,
+                        "local_present": is_present,
+                        "category": cat_info.get("label", "Normal / Front"),
+                        "category_type": cat_info.get("type", "Normal"),
+                        "category_position": cat_info.get("position", "Front"),
+                        "stream_url": f"/stream/{urllib.parse.quote(fn)}" if is_present else None,
+                    }
+                )
+
+            self._send_json(HTTPStatus.OK, {"videos": video_list, "count": len(video_list)})
+        except Exception as exc:
+            logger.error(f"Error in _handle_api_videos: {exc}", exc_info=True)
+            self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"videos": [], "count": 0, "error": str(exc)})
 
     def _handle_api_cleanup(self):
         logger.info("Manual cleanup requested via Web API.")
@@ -1088,26 +1097,47 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         async function loadStatus() {
             try {
                 const res = await fetch('/api/status');
+                if (!res.ok) {
+                    console.error('Status request failed with status:', res.status);
+                    return;
+                }
                 const data = await res.json();
                 
-                const s = data.storage;
-                document.getElementById('storage-summary').innerHTML = 
-                    `<b>${s.used_gb} GB</b> used of <b>${s.total_gb} GB</b> (${s.free_gb} GB free, Min reserve: ${s.min_free_space_gb} GB)`;
-                document.getElementById('storage-bar').style.width = s.percent_used + '%';
+                const s = data.storage || {};
+                const summaryEl = document.getElementById('storage-summary');
+                if (summaryEl) {
+                    summaryEl.innerHTML = 
+                        `<b>${s.used_gb ?? 0} GB</b> used of <b>${s.total_gb ?? 0} GB</b> (${s.free_gb ?? 0} GB free, Min reserve: ${s.min_free_space_gb ?? 0} GB)`;
+                }
+                const barEl = document.getElementById('storage-bar');
+                if (barEl) {
+                    barEl.style.width = (s.percent_used ?? 0) + '%';
+                }
 
                 const q = data.queue || {};
-                document.getElementById('queue-pending').innerHTML = 
-                    `<b>${q.pending_download_count || 0}</b> files`;
-                document.getElementById('queue-breakdown').innerHTML = 
-                    `<span class="pill pill-warn">${q.pending_event_count || 0} Event</span> <span class="pill">${q.pending_normal_count || 0} Normal</span>`;
+                const queuePendingEl = document.getElementById('queue-pending');
+                if (queuePendingEl) {
+                    queuePendingEl.innerHTML = `<b>${q.pending_download_count || 0}</b> files`;
+                }
+                const queueBreakdownEl = document.getElementById('queue-breakdown');
+                if (queueBreakdownEl) {
+                    queueBreakdownEl.innerHTML = 
+                        `<span class="pill pill-warn">${q.pending_event_count || 0} Event</span> <span class="pill">${q.pending_normal_count || 0} Normal</span>`;
+                }
 
-                const w0 = data.network.wlan0;
-                document.getElementById('net-wlan0').innerHTML = 
-                    `${w0.ip} <span class="pill ${w0.dashcam_reachable ? 'pill-green':'pill-warn'}">${w0.dashcam_reachable ? 'Dashcam Reachable':'Idle'}</span>`;
+                const w0 = (data.network && data.network.wlan0) || {};
+                const w0El = document.getElementById('net-wlan0');
+                if (w0El) {
+                    w0El.innerHTML = 
+                        `${w0.ip || 'N/A'} <span class="pill ${w0.dashcam_reachable ? 'pill-green':'pill-warn'}">${w0.dashcam_reachable ? 'Dashcam Reachable':'Idle'}</span>`;
+                }
 
-                const w1 = data.network.wlan1;
-                document.getElementById('net-wlan1').innerHTML = 
-                    `${w1.ip} <span class="pill ${w1.internet_reachable ? 'pill-green':'pill-warn'}">${w1.internet_reachable ? 'Internet OK':'Local Only'}</span>`;
+                const w1 = (data.network && data.network.wlan1) || {};
+                const w1El = document.getElementById('net-wlan1');
+                if (w1El) {
+                    w1El.innerHTML = 
+                        `${w1.ip || 'N/A'} <span class="pill ${w1.internet_reachable ? 'pill-green':'pill-warn'}">${w1.internet_reachable ? 'Internet OK':'Local Only'}</span>`;
+                }
             } catch(e) { console.error('Status error:', e); }
         }
 
@@ -1124,10 +1154,20 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         async function loadVideos() {
             try {
                 const res = await fetch('/api/videos?status=all');
+                if (!res.ok) {
+                    console.error('Video request failed with status:', res.status);
+                    const container = document.getElementById('video-list');
+                    if (container) container.innerHTML = '<div style="color:var(--accent-alert); padding:12px 0;">Error loading video library.</div>';
+                    return;
+                }
                 const data = await res.json();
                 allVideos = data.videos || [];
                 renderVideos();
-            } catch(e) { console.error('Video load error:', e); }
+            } catch(e) {
+                console.error('Video load error:', e);
+                const container = document.getElementById('video-list');
+                if (container) container.innerHTML = '<div style="color:var(--accent-alert); padding:12px 0;">Error loading video library.</div>';
+            }
         }
 
         function setCameraFilter(camera, btn) {
