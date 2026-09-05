@@ -1368,7 +1368,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 let summaryMsg = `Bulk deletion finished (Scope: ${scope}):\n` +
                     `Total: ${data.total}, Successful: ${data.successful}, Failed: ${data.failed}\n\n`;
                 if (data.results && data.results.length > 0) {
-                    summaryMsg += data.results.map(r => `• ${r.filename}: ${r.message}`).join('\n');
+                    summaryMsg += data.results.map(r => `• ${r.filename}: ${r.message}`).join('\\n');
                 }
                 alert(summaryMsg);
 
