@@ -138,6 +138,8 @@ class VantrueWebHandler(BaseHTTPRequestHandler):
             self._handle_api_cleanup()
         elif path == "/api/rescan":
             self._handle_api_rescan()
+        elif path == "/api/backfill":
+            self._handle_api_backfill()
         else:
             self.send_error(HTTPStatus.NOT_FOUND, "Endpoint not found")
 
@@ -274,6 +276,31 @@ class VantrueWebHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             logger.error(f"Manual rescan error: {exc}")
             self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"status": "error", "message": str(exc)})
+
+    def _handle_api_backfill(self):
+        logger.info("Manual Drive ID backfill requested via Web API.")
+        try:
+            from uploader import VantrueUploader
+            uploader = VantrueUploader(Config)
+            count_before = len(uploader.db.get_recordings_missing_drive_id(limit=5000))
+            uploader.backfill_missing_drive_ids(max_batch=50)
+            count_after = len(uploader.db.get_recordings_missing_drive_id(limit=5000))
+            processed = count_before - count_after
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "status": "success",
+                    "processed": processed,
+                    "remaining": count_after,
+                    "message": f"Backfilled {processed} Google Drive file IDs ({count_after} remaining).",
+                },
+            )
+        except Exception as exc:
+            logger.error(f"Manual backfill error: {exc}")
+            self._send_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {"status": "error", "message": str(exc)},
+            )
 
     def _handle_stream_video(self, filename: str):
         """
@@ -567,12 +594,22 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <button class="filter-btn active" onclick="setFilter('all', this)">All</button>
             <button class="filter-btn" onclick="setFilter('uploaded', this)">Cloud Synced</button>
             <button class="filter-btn" onclick="setFilter('downloaded', this)">Waiting Upload</button>
+            <button class="filter-btn" style="margin-left:auto;" onclick="triggerBackfill()">Sync Drive Links</button>
         </div>
         <div id="video-list">Loading videos...</div>
     </div>
 
     <script>
         let currentFilter = 'all';
+
+        async function triggerBackfill() {
+            try {
+                const res = await fetch('/api/backfill', { method: 'POST' });
+                const data = await res.json();
+                alert(data.message || 'Drive links synced.');
+                loadAll();
+            } catch(e) { alert('Backfill error: ' + e); }
+        }
 
         async function loadStatus() {
             try {
