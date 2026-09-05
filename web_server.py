@@ -334,6 +334,25 @@ class VantrueWebHandler(BaseHTTPRequestHandler):
             cloud_embed_url = f"https://drive.google.com/file/d/{drive_id}/preview" if drive_id else None
             cloud_direct_url = f"https://drive.google.com/uc?export=download&id={drive_id}" if drive_id else None
 
+            db_status = r["status"]
+            is_synced = db_status in ("uploaded", "deleted") or bool(drive_id)
+
+            # Explicit file state classification (dashcam, local, local+cloud, cloud, missing, purged)
+            if db_status == "discovered" and not is_present:
+                file_state = "dashcam"
+            elif is_present and is_synced:
+                file_state = "local+cloud"
+            elif is_present and not is_synced:
+                file_state = "local"
+            elif not is_present and is_synced:
+                file_state = "cloud"
+            elif not is_present and db_status == "downloaded":
+                file_state = "missing"
+            elif not is_present and db_status == "deleted" and not is_synced:
+                file_state = "purged"
+            else:
+                file_state = db_status
+
             cat_info = categorize_filename(fn)
             video_list.append(
                 {
@@ -342,6 +361,7 @@ class VantrueWebHandler(BaseHTTPRequestHandler):
                     "file_size": r["file_size"],
                     "file_size_mb": round(r["file_size"] / (1024 * 1024), 1),
                     "status": r["status"],
+                    "file_state": file_state,
                     "uploaded_at": r["uploaded_at"] if "uploaded_at" in r.keys() else None,
                     "drive_file_id": drive_id,
                     "cloud_play_url": cloud_play_url,
@@ -686,8 +706,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             font-size: 0.75rem;
             font-weight: 600;
         }
+        .pill-info { background: rgba(56, 189, 248, 0.2); color: var(--accent-color); }
         .pill-green { background: rgba(34, 197, 94, 0.2); color: var(--accent-green); }
         .pill-warn { background: rgba(234, 179, 8, 0.2); color: var(--accent-warn); }
+        .pill-alert { background: rgba(239, 68, 68, 0.2); color: var(--accent-alert); }
         
         .filter-controls {
             display: flex;
@@ -880,39 +902,63 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 }
 
                 container.innerHTML = data.videos.map(v => {
-                    const isSynced = (v.status === 'uploaded' || v.status === 'deleted');
-                    const isLocal = Boolean(v.local_present);
                     const hasCloudUrl = Boolean(v.cloud_play_url);
                     const localStreamUrl = `/stream/${encodeURIComponent(v.filename)}?source=local`;
                     const cloudStreamUrl = `/stream/${encodeURIComponent(v.filename)}?source=cloud`;
 
+                    let stateBadge = '';
+                    let stateClass = '';
                     let actionHtml = '';
 
-                    if (isLocal && isSynced) {
-                        actionHtml += `<button class="action-btn local-btn" onclick="playVideo(this, '${localStreamUrl}')">▶️ Play Local (Pi)</button>`;
-                        actionHtml += `<button class="action-btn cloud-btn" onclick="playVideo(this, '${cloudStreamUrl}')">☁️ Play Cloud (Proxy)</button>`;
-                        if (hasCloudUrl) {
-                            actionHtml += `<a href="${v.cloud_play_url}" target="_blank" class="action-btn link-btn">🔗 Drive Tab</a>`;
-                        }
-                    } else if (isLocal) {
-                        actionHtml += `<button class="action-btn local-btn" onclick="playVideo(this, '${localStreamUrl}')">▶️ Play Local (Pi)</button>`;
-                    } else if (isSynced) {
-                        actionHtml += `<button class="action-btn cloud-btn" onclick="playVideo(this, '${cloudStreamUrl}')">☁️ Play Cloud (Proxy)</button>`;
-                        if (hasCloudUrl) {
-                            actionHtml += `<a href="${v.cloud_play_url}" target="_blank" class="action-btn link-btn">🔗 Drive Tab</a>`;
-                        }
-                    } else {
-                        actionHtml = `<span style="font-size:0.8rem; color:var(--text-muted)">File purged / unavailable</span>`;
+                    switch (v.file_state) {
+                        case 'dashcam':
+                            stateBadge = '📷 On Dashcam';
+                            stateClass = 'pill-info';
+                            actionHtml = `<span style="font-size:0.85rem; color:var(--accent-color)">📷 On Dashcam (Awaiting Pi download)</span>`;
+                            break;
+                        case 'local':
+                            stateBadge = '💾 Local (Pi)';
+                            stateClass = 'pill-warn';
+                            actionHtml = `<button class="action-btn local-btn" onclick="playVideo(this, '${localStreamUrl}')">▶️ Play Local (Pi)</button>`;
+                            break;
+                        case 'local+cloud':
+                            stateBadge = '⚡ Local + Cloud';
+                            stateClass = 'pill-green';
+                            actionHtml = `<button class="action-btn local-btn" onclick="playVideo(this, '${localStreamUrl}')">▶️ Play Local (Pi)</button>`;
+                            actionHtml += `<button class="action-btn cloud-btn" onclick="playVideo(this, '${cloudStreamUrl}')">☁️ Play Cloud (Proxy)</button>`;
+                            if (hasCloudUrl) {
+                                actionHtml += `<a href="${v.cloud_play_url}" target="_blank" class="action-btn link-btn">🔗 Drive Tab</a>`;
+                            }
+                            break;
+                        case 'cloud':
+                            stateBadge = '☁️ Cloud Only';
+                            stateClass = 'pill-green';
+                            actionHtml = `<button class="action-btn cloud-btn" onclick="playVideo(this, '${cloudStreamUrl}')">☁️ Play Cloud (Proxy)</button>`;
+                            if (hasCloudUrl) {
+                                actionHtml += `<a href="${v.cloud_play_url}" target="_blank" class="action-btn link-btn">🔗 Drive Tab</a>`;
+                            }
+                            break;
+                        case 'missing':
+                            stateBadge = '⚠️ Missing Local File';
+                            stateClass = 'pill-alert';
+                            actionHtml = `<span style="font-size:0.85rem; color:var(--accent-alert)">⚠️ Local file missing unexpectedly on Pi</span>`;
+                            break;
+                        case 'purged':
+                            stateBadge = '🗑️ Local Purged';
+                            stateClass = 'pill-alert';
+                            actionHtml = `<span style="font-size:0.85rem; color:var(--text-muted)">Local copy purged</span>`;
+                            break;
+                        default:
+                            stateBadge = v.file_state || v.status;
+                            stateClass = 'pill-warn';
+                            actionHtml = `<span style="font-size:0.85rem; color:var(--text-muted)">Status: ${v.status}</span>`;
                     }
-
-                    const statusBadge = isSynced ? (isLocal ? 'Local + Cloud' : 'Cloud Only') : 'Local Only';
-                    const statusClass = isSynced ? 'pill-green' : 'pill-warn';
 
                     return `
                     <div class="video-item">
                         <div class="video-header">
                             <span class="video-title">${v.filename}</span>
-                            <span class="pill ${statusClass}">${statusBadge}</span>
+                            <span class="pill ${stateClass}">${stateBadge}</span>
                         </div>
                         <div class="video-meta">
                             <span>📅 ${v.recording_timestamp}</span>

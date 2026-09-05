@@ -243,7 +243,7 @@ class VantrueSyncEngine:
                 if dir_url not in visited_urls and dir_url not in urls_to_visit:
                     urls_to_visit.append(dir_url)
 
-        logger.info(f"Discovered {len(discovered)} supported files on dashcam HTTP server.")
+        logger.info(f"Discovered {len(discovered)} supported files on dashcam [location: on dashcam].")
         return discovered
 
     def get_current_local_buffer_size(self) -> int:
@@ -310,7 +310,7 @@ class VantrueSyncEngine:
         # If already downloaded physically and in DB, skip
         if final_path.exists() and final_path.stat().st_size > 0:
             if self.db.is_already_downloaded_or_synced(remote_url):
-                logger.debug(f"File '{filename}' already downloaded and indexed in DB. Skipping.")
+                logger.debug(f"File '{filename}' already downloaded and indexed in DB [location: local Pi]. Skipping.")
                 return True
 
         # Remove incomplete .part file from previous interrupted run
@@ -318,7 +318,7 @@ class VantrueSyncEngine:
             logger.info(f"Removing incomplete temporary file '{part_path.name}'.")
             part_path.unlink(missing_ok=True)
 
-        logger.info(f"Download started file={filename} url={remote_url} dest={final_path}")
+        logger.info(f"Download started [dashcam -> local Pi]: file={filename} url={remote_url} dest={final_path}")
         start_time = time.time()
 
         set_transfer_in_progress(True)
@@ -350,7 +350,7 @@ class VantrueSyncEngine:
 
             size_mb = final_size / (1024 * 1024)
             logger.info(
-                f"Download completed file={filename} bytes={final_size} duration={duration:.1f}s ({size_mb:.1f} MB)"
+                f"Download completed [location: local Pi]: file={filename} bytes={final_size} duration={duration:.1f}s ({size_mb:.1f} MB)"
             )
             return True
 

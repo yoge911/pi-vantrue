@@ -48,7 +48,7 @@ class VantrueUploader:
 
         if not local_path.exists() or not local_path.is_file():
             logger.warning(
-                f"Local file '{filename}' does not exist. Skipping upload."
+                f"File '{filename}' marked for upload is missing unexpectedly from local Pi storage [location: missing unexpectedly]. Skipping upload."
             )
             return False
 
@@ -62,7 +62,7 @@ class VantrueUploader:
         file_size_bytes = local_path.stat().st_size if local_path.exists() else 0
         file_size_mb = file_size_bytes / (1024 * 1024)
 
-        logger.info(f"Upload started file={filename} size={file_size_mb:.1f}MB target={rclone_target}")
+        logger.info(f"Upload started [local Pi -> Google Drive]: file={filename} size={file_size_mb:.1f}MB target={rclone_target}")
 
         cmd = [
             "rclone",
@@ -97,7 +97,7 @@ class VantrueUploader:
         duration = time.time() - start_time
         if result.returncode == 0:
             logger.info(
-                f"Upload completed file={filename} bytes={file_size_bytes} duration={duration:.1f}s"
+                f"Upload completed [location: local Pi + Google Drive]: file={filename} bytes={file_size_bytes} duration={duration:.1f}s"
             )
             return True
 
