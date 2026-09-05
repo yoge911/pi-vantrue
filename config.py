@@ -23,7 +23,9 @@ class Config:
     LOG_DIR = Path(
         os.environ.get(
             "LOG_DIR",
-            "/home/picar/vantrue-automation/logs",
+            "/home/picar/vantrue-automation/logs"
+            if Path("/home/picar").exists()
+            else str(Path(__file__).parent / "logs"),
         )
     )
     LOG_FILE = LOG_DIR / "vantrue.log"
@@ -38,14 +40,21 @@ class Config:
 
     # Local video buffer directory
     LOCAL_DOWNLOAD_DIR = Path(
-        os.environ.get("LOCAL_DOWNLOAD_DIR", "/home/picar/vantrue-videos")
+        os.environ.get(
+            "LOCAL_DOWNLOAD_DIR",
+            "/home/picar/vantrue-videos"
+            if Path("/home/picar").exists()
+            else str(Path(__file__).parent / "vantrue-videos"),
+        )
     )
 
     # SQLite Database Path
     DB_PATH = Path(
         os.environ.get(
             "DB_PATH",
-            "/home/picar/vantrue-automation/pi-vantrue/sync_state.db",
+            "/home/picar/vantrue-automation/pi-vantrue/sync_state.db"
+            if Path("/home/picar").exists()
+            else str(Path(__file__).parent / "sync_state.db"),
         )
     )
 

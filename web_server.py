@@ -1433,9 +1433,25 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             } catch(e) { alert('Cleanup error: ' + e); }
         }
 
-        function loadAll() {
-            loadStatus();
-            loadVideos();
+        async function loadAll() {
+            console.log("[dashboard] VANTRUE DASHBOARD BUILD 2026-09-05");
+            console.log("[dashboard] START loadAll");
+            
+            try {
+                console.log("[dashboard] loading status...");
+                await loadStatus();
+                console.log("[status] PASS");
+            } catch (err) {
+                console.error("[status] FAIL", err);
+            }
+
+            try {
+                console.log("[dashboard] loading videos...");
+                await loadVideos();
+                console.log("[videos] PASS");
+            } catch (err) {
+                console.error("[videos] FAIL", err);
+            }
         }
 
         if (document.readyState === 'complete' || document.readyState === 'interactive') {
