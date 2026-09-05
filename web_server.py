@@ -306,18 +306,13 @@ class VantrueWebHandler(BaseHTTPRequestHandler):
 
     def _handle_stream_video(self, filename: str):
         """
-        Stream local MP4 video file supporting HTTP Byte-Range requests for iOS Safari / Chrome seeking.
+        Stream MP4 video file supporting HTTP Byte-Range requests for iOS Safari / Chrome seeking.
+        If file exists locally, stream directly from disk.
+        If file is cloud-synced (uploaded/deleted), proxy stream from Google Drive via rclone cat with Byte-Range support.
         Includes strict path traversal security checks.
         """
         base_dir = Config.LOCAL_DOWNLOAD_DIR.resolve()
         target_path = (base_dir / filename).resolve()
-
-        if not target_path.exists() or not target_path.is_file() or base_dir not in target_path.parents:
-            self.send_error(HTTPStatus.NOT_FOUND, "Video file not found")
-            return
-
-        file_size = target_path.stat().st_size
-        range_header = self.headers.get("Range")
 
         content_type = "video/mp4"
         fn_lower = filename.lower()
@@ -328,7 +323,78 @@ class VantrueWebHandler(BaseHTTPRequestHandler):
         elif fn_lower.endswith((".gps", ".dat", ".log", ".txt")):
             content_type = "text/plain"
 
-        if range_header:
+        # --- PATH A: FILE IS PRESENT ON LOCAL DISK ---
+        if target_path.exists() and target_path.is_file() and base_dir in target_path.parents:
+            file_size = target_path.stat().st_size
+            range_header = self.headers.get("Range")
+
+            if range_header:
+                try:
+                    byte_range = range_header.replace("bytes=", "").split("-")
+                    start_byte = int(byte_range[0])
+                    end_byte = int(byte_range[1]) if byte_range[1] else file_size - 1
+
+                    if start_byte >= file_size or end_byte >= file_size or start_byte > end_byte:
+                        self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                        self.send_header("Content-Range", f"bytes */{file_size}")
+                        self.end_headers()
+                        return
+
+                    chunk_len = end_byte - start_byte + 1
+                    self.send_response(HTTPStatus.PARTIAL_CONTENT)
+                    self.send_header("Content-Type", content_type)
+                    self.send_header("Accept-Ranges", "bytes")
+                    self.send_header("Content-Range", f"bytes {start_byte}-{end_byte}/{file_size}")
+                    self.send_header("Content-Length", str(chunk_len))
+                    self.end_headers()
+
+                    with open(target_path, "rb") as f:
+                        f.seek(start_byte)
+                        bytes_remaining = chunk_len
+                        buffer_size = 64 * 1024
+                        while bytes_remaining > 0:
+                            read_size = min(buffer_size, bytes_remaining)
+                            data = f.read(read_size)
+                            if not data:
+                                break
+                            self.wfile.write(data)
+                            bytes_remaining -= len(data)
+                    return
+
+                except (ValueError, IndexError, OSError) as exc:
+                    logger.debug(f"Range parsing or socket error for '{filename}': {exc}")
+                    return
+
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(file_size))
+            self.end_headers()
+
+            try:
+                with open(target_path, "rb") as f:
+                    buffer_size = 64 * 1024
+                    while True:
+                        data = f.read(buffer_size)
+                        if not data:
+                            break
+                        self.wfile.write(data)
+            except OSError:
+                pass
+            return
+
+        # --- PATH B: FILE IS CLOUD-SYNCED (PI PROXIED STREAM FROM GOOGLE DRIVE VIA RCLONE CAT) ---
+        db = SyncDB(Config.DB_PATH)
+        record = db.get_recording_by_filename(filename)
+        if not record or record["status"] not in ("uploaded", "deleted"):
+            self.send_error(HTTPStatus.NOT_FOUND, "Video file not found")
+            return
+
+        file_size = record["file_size"] if record["file_size"] else 0
+        remote_target = f"{Config.RCLONE_REMOTE}{Config.RCLONE_DESTINATION}/{filename}"
+        range_header = self.headers.get("Range")
+
+        if range_header and file_size > 0:
             try:
                 byte_range = range_header.replace("bytes=", "").split("-")
                 start_byte = int(byte_range[0])
@@ -348,39 +414,55 @@ class VantrueWebHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Length", str(chunk_len))
                 self.end_headers()
 
-                with open(target_path, "rb") as f:
-                    f.seek(start_byte)
-                    bytes_remaining = chunk_len
-                    buffer_size = 64 * 1024
-                    while bytes_remaining > 0:
-                        read_size = min(buffer_size, bytes_remaining)
-                        data = f.read(read_size)
-                        if not data:
+                cmd = [
+                    "rclone",
+                    "cat",
+                    "--offset",
+                    str(start_byte),
+                    "--count",
+                    str(chunk_len),
+                    remote_target,
+                ]
+
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                try:
+                    while True:
+                        chunk = proc.stdout.read(64 * 1024)
+                        if not chunk:
                             break
-                        self.wfile.write(data)
-                        bytes_remaining -= len(data)
+                        self.wfile.write(chunk)
+                except (OSError, BrokenPipeError):
+                    pass
+                finally:
+                    proc.kill()
+                    proc.wait()
                 return
 
-            except (ValueError, IndexError, OSError) as exc:
-                logger.debug(f"Range parsing or socket error for '{filename}': {exc}")
+            except Exception as exc:
+                logger.warning(f"Cloud stream range error for '{filename}': {exc}")
                 return
 
+        # Full stream request
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
         self.send_header("Accept-Ranges", "bytes")
-        self.send_header("Content-Length", str(file_size))
+        if file_size > 0:
+            self.send_header("Content-Length", str(file_size))
         self.end_headers()
 
+        cmd = ["rclone", "cat", remote_target]
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         try:
-            with open(target_path, "rb") as f:
-                buffer_size = 64 * 1024
-                while True:
-                    data = f.read(buffer_size)
-                    if not data:
-                        break
-                    self.wfile.write(data)
-        except OSError:
+            while True:
+                chunk = proc.stdout.read(64 * 1024)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+        except (OSError, BrokenPipeError):
             pass
+        finally:
+            proc.kill()
+            proc.wait()
 
 
 HTML_TEMPLATE = """<!DOCTYPE html>
@@ -662,23 +744,22 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
                 container.innerHTML = data.videos.map(v => {
                     const isSynced = (v.status === 'uploaded' || v.status === 'deleted');
-                    const hasCloudUrl = Boolean(v.cloud_play_url || v.cloud_embed_url);
-                    const hasLocalStream = Boolean(v.local_present && v.stream_url);
+                    const hasCloudUrl = Boolean(v.cloud_play_url);
+                    const canStream = Boolean(v.local_present || isSynced);
+                    const streamUrl = `/stream/${encodeURIComponent(v.filename)}`;
 
                     let actionHtml = '';
 
+                    if (canStream) {
+                        const playLabel = isSynced ? '▶️ Play Video (Cloud Proxy)' : '▶️ Play Video (Local Cache)';
+                        actionHtml += `<button class="action-btn cloud-btn" onclick="playVideo(this, '${streamUrl}')">${playLabel}</button>`;
+                    }
+
                     if (isSynced && hasCloudUrl) {
-                        // Once uploaded, primary playback uses native HTML5 video element fed by direct Drive URL
-                        actionHtml += `<button class="action-btn cloud-btn" onclick="playVideo(this, null, '${v.cloud_embed_url || ''}', '${v.cloud_play_url || ''}', '${v.cloud_direct_url || ''}')">☁️ Play Cloud (Drive)</button>`;
                         actionHtml += `<a href="${v.cloud_play_url}" target="_blank" class="action-btn" style="background:#334155; color:var(--text-color); text-decoration:none; display:inline-block; margin-left:6px;">🔗 Open Drive Tab</a>`;
-                        
-                        if (hasLocalStream) {
-                            actionHtml += `<button class="action-btn" style="background:#0f172a; color:var(--text-muted); border:1px solid var(--border-color); margin-left:6px;" onclick="playVideo(this, '${v.stream_url}', null, null, null)">📱 Stream Local Pi</button>`;
-                        }
-                    } else if (hasLocalStream) {
-                        // Unsynced video -> Stream locally from Pi
-                        actionHtml += `<button class="action-btn" onclick="playVideo(this, '${v.stream_url}', null, null, null)">📱 Play Local (Pi)</button>`;
-                    } else {
+                    }
+
+                    if (!canStream && !hasCloudUrl) {
                         actionHtml = `<span style="font-size:0.8rem; color:var(--text-muted)">File purged locally (Cloud link pending)</span>`;
                     }
 
@@ -701,9 +782,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             } catch(e) { console.error('Video load error:', e); }
         }
 
-        function playVideo(btn, streamUrl, cloudEmbedUrl, cloudPlayUrl, cloudDirectUrl) {
+        function playVideo(btn, streamUrl) {
             const parent = btn.parentElement;
-            const existingMedia = parent.querySelector('video, iframe');
+            const existingMedia = parent.querySelector('video');
             if (existingMedia) {
                 existingMedia.remove();
                 const orig = btn.getAttribute('data-original-label');
@@ -715,54 +796,19 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 btn.setAttribute('data-original-label', btn.innerText);
             }
 
-            const mediaUrl = cloudDirectUrl || streamUrl;
+            const video = document.createElement('video');
+            video.controls = true;
+            video.preload = 'metadata';
+            video.src = streamUrl;
+            video.style.width = '100%';
+            video.style.maxHeight = '360px';
+            video.style.borderRadius = '8px';
+            video.style.marginTop = '8px';
+            video.style.background = '#000';
 
-            if (mediaUrl) {
-                const video = document.createElement('video');
-                video.controls = true;
-                video.preload = 'metadata';
-                video.src = mediaUrl;
-                video.style.width = '100%';
-                video.style.maxHeight = '360px';
-                video.style.borderRadius = '8px';
-                video.style.marginTop = '8px';
-                video.style.background = '#000';
-
-                if (cloudEmbedUrl) {
-                    video.onerror = function() {
-                        console.warn('Direct HTML5 cloud stream restricted; falling back to Drive iframe player.');
-                        video.remove();
-                        const iframe = document.createElement('iframe');
-                        iframe.src = cloudEmbedUrl;
-                        iframe.style.width = '100%';
-                        iframe.style.height = '360px';
-                        iframe.style.border = 'none';
-                        iframe.style.borderRadius = '8px';
-                        iframe.style.marginTop = '8px';
-                        iframe.allow = 'autoplay; encrypted-media; picture-in-picture';
-                        iframe.allowFullscreen = true;
-                        parent.appendChild(iframe);
-                    };
-                }
-
-                parent.appendChild(video);
-                video.play().catch(e => console.log('Autoplay deferred:', e));
-                btn.innerText = cloudDirectUrl ? 'Close Cloud Player' : 'Close Local Player';
-            } else if (cloudEmbedUrl) {
-                const iframe = document.createElement('iframe');
-                iframe.src = cloudEmbedUrl;
-                iframe.style.width = '100%';
-                iframe.style.height = '360px';
-                iframe.style.border = 'none';
-                iframe.style.borderRadius = '8px';
-                iframe.style.marginTop = '8px';
-                iframe.allow = 'autoplay; encrypted-media; picture-in-picture';
-                iframe.allowFullscreen = true;
-                parent.appendChild(iframe);
-                btn.innerText = 'Close Cloud Player';
-            } else if (cloudPlayUrl) {
-                window.open(cloudPlayUrl, '_blank');
-            }
+            parent.appendChild(video);
+            video.play().catch(e => console.log('Autoplay deferred:', e));
+            btn.innerText = 'Close Video Player';
         }
 
         function setFilter(filter, btn) {

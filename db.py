@@ -192,6 +192,18 @@ class SyncDB:
                 return True
             return False
 
+    def get_recording_by_filename(self, filename: str) -> Optional[sqlite3.Row]:
+        """Fetch a single recording record by filename."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT * FROM recordings WHERE filename = ?;
+                """,
+                (filename,),
+            )
+            return cursor.fetchone()
+
     def get_pending_uploads(self) -> List[sqlite3.Row]:
         """Fetch downloaded recordings awaiting upload sorted chronologically oldest-first."""
         with self._get_connection() as conn:
