@@ -9,6 +9,7 @@ import sys
 import time
 import urllib.parse
 
+import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -21,6 +22,110 @@ from logger import setup_logging
 from retention import RetentionManager
 
 logger = logging.getLogger("web")
+
+
+class CloudStreamCache:
+    """Thread-safe local disk cache for initial byte ranges of cloud-synced videos.
+
+    Eliminates high-latency subprocess overhead during iOS AVPlayer initial metadata range probes.
+    """
+
+    def __init__(
+        self,
+        cache_dir: Path = Path("/tmp/cloud_stream_cache"),
+        prefetch_bytes: int = 4 * 1024 * 1024,
+        max_files: int = 20,
+    ):
+        self.cache_dir = cache_dir
+        self.prefetch_bytes = prefetch_bytes
+        self.max_files = max_files
+        self.lock = threading.Lock()
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def _clean_old_entries(self):
+        """Clean up oldest cached chunk files if max file limit is exceeded."""
+        try:
+            files = sorted(
+                self.cache_dir.glob("*.part0"), key=lambda p: p.stat().st_mtime
+            )
+            while len(files) >= self.max_files:
+                oldest = files.pop(0)
+                try:
+                    oldest.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        except Exception as exc:
+            logger.debug(f"Cloud stream cache cleanup error: {exc}")
+
+    def get_cached_chunk(
+        self,
+        filename: str,
+        remote_target: str,
+        start_byte: int,
+        end_byte: int,
+        total_file_size: int,
+    ) -> Optional[bytes]:
+        """Return cached bytes if request falls within cached initial range [start_byte, end_byte], else None."""
+        if total_file_size <= 0:
+            return None
+
+        safe_filename = re.sub(r"[^a-zA-Z0-9_\-\.]", "_", filename)
+        cache_file = self.cache_dir / f"{safe_filename}.part0"
+        needed_prefetch = min(self.prefetch_bytes, total_file_size)
+
+        with self.lock:
+            if not cache_file.exists() or cache_file.stat().st_size < needed_prefetch:
+                if start_byte < self.prefetch_bytes:
+                    self._clean_old_entries()
+                    temp_file = (
+                        self.cache_dir
+                        / f"{safe_filename}.part0.tmp.{os.getpid()}_{threading.get_ident()}"
+                    )
+                    cmd = [
+                        "rclone",
+                        "cat",
+                        "--offset",
+                        "0",
+                        "--count",
+                        str(needed_prefetch),
+                        remote_target,
+                    ]
+                    try:
+                        logger.info(
+                            f"Prefetching initial {needed_prefetch} bytes for cloud video '{filename}' into cache..."
+                        )
+                        res = subprocess.run(cmd, capture_output=True, timeout=15)
+                        if res.returncode == 0 and len(res.stdout) > 0:
+                            with open(temp_file, "wb") as f:
+                                f.write(res.stdout)
+                            temp_file.replace(cache_file)
+                        else:
+                            if temp_file.exists():
+                                temp_file.unlink(missing_ok=True)
+                    except Exception as exc:
+                        logger.warning(
+                            f"Failed to prefetch cloud stream chunk for '{filename}': {exc}"
+                        )
+                        if temp_file.exists():
+                            temp_file.unlink(missing_ok=True)
+
+        if cache_file.exists():
+            try:
+                cached_size = cache_file.stat().st_size
+                if start_byte < cached_size and end_byte < cached_size:
+                    with open(cache_file, "rb") as f:
+                        f.seek(start_byte)
+                        read_len = end_byte - start_byte + 1
+                        return f.read(read_len)
+            except OSError as exc:
+                logger.warning(
+                    f"Error reading cloud stream cache file '{cache_file}': {exc}"
+                )
+
+        return None
+
+
+cloud_stream_cache = CloudStreamCache()
 
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
@@ -346,6 +451,7 @@ class VantrueWebHandler(BaseHTTPRequestHandler):
                     self.send_header("Accept-Ranges", "bytes")
                     self.send_header("Content-Range", f"bytes {start_byte}-{end_byte}/{file_size}")
                     self.send_header("Content-Length", str(chunk_len))
+                    self.send_header("Cache-Control", "public, max-age=3600")
                     self.end_headers()
 
                     with open(target_path, "rb") as f:
@@ -369,6 +475,7 @@ class VantrueWebHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", content_type)
             self.send_header("Accept-Ranges", "bytes")
             self.send_header("Content-Length", str(file_size))
+            self.send_header("Cache-Control", "public, max-age=3600")
             self.end_headers()
 
             try:
@@ -407,11 +514,28 @@ class VantrueWebHandler(BaseHTTPRequestHandler):
                     return
 
                 chunk_len = end_byte - start_byte + 1
+
+                # Check initial range disk cache first for fast metadata access (iOS AVPlayer optimization)
+                cached_bytes = cloud_stream_cache.get_cached_chunk(
+                    filename, remote_target, start_byte, end_byte, file_size
+                )
+                if cached_bytes is not None:
+                    self.send_response(HTTPStatus.PARTIAL_CONTENT)
+                    self.send_header("Content-Type", content_type)
+                    self.send_header("Accept-Ranges", "bytes")
+                    self.send_header("Content-Range", f"bytes {start_byte}-{end_byte}/{file_size}")
+                    self.send_header("Content-Length", str(len(cached_bytes)))
+                    self.send_header("Cache-Control", "public, max-age=3600")
+                    self.end_headers()
+                    self.wfile.write(cached_bytes)
+                    return
+
                 self.send_response(HTTPStatus.PARTIAL_CONTENT)
                 self.send_header("Content-Type", content_type)
                 self.send_header("Accept-Ranges", "bytes")
                 self.send_header("Content-Range", f"bytes {start_byte}-{end_byte}/{file_size}")
                 self.send_header("Content-Length", str(chunk_len))
+                self.send_header("Cache-Control", "public, max-age=3600")
                 self.end_headers()
 
                 cmd = [
@@ -446,6 +570,7 @@ class VantrueWebHandler(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
         self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Cache-Control", "public, max-age=3600")
         if file_size > 0:
             self.send_header("Content-Length", str(file_size))
         self.end_headers()
