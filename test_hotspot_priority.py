@@ -153,6 +153,26 @@ class TestHotspotPrioritySelection(unittest.TestCase):
 
         self.assertFalse(result)
 
+    @patch("main.check_interface_exists", return_value=True)
+    @patch("main.get_active_wifi_connection", return_value="iPhone")
+    @patch("main.is_ssid_visible")
+    @patch("main.connect")
+    def test_7_active_conn_is_iphone_switches_to_preferred_when_available(
+        self, mock_connect, mock_is_visible, mock_active, mock_iface
+    ):
+        """TEST 7: Active connection is 'iPhone', preferred becomes available -> switches to Vantrue-iPhone-Hotspot when idle."""
+        mock_uploader = MagicMock()
+        mock_uploader.check_internet_connectivity.return_value = True
+        mock_is_visible.side_effect = lambda ssid, interface, rescan: ssid == "Vantrue-iPhone-Hotspot"
+        mock_connect.return_value = True
+
+        result = main.ensure_internet_connection_wlan1(uploader=mock_uploader)
+
+        self.assertTrue(result)
+        mock_connect.assert_called_once_with(
+            "Vantrue-iPhone-Hotspot", interface="wlan1", check_visibility=False
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

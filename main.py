@@ -155,7 +155,7 @@ def ensure_internet_connection_wlan1(uploader: Optional[VantrueUploader] = None)
     """
     Ensure wlan1 has a healthy internet connection, managing priority hotspot selection:
       1. Preferred: Config.PREFERRED_HOTSPOT_SSID ("Vantrue-iPhone-Hotspot")
-      2. Fallback: Config.FALLBACK_HOTSPOT_SSID (regular iPhone e.g. "iPhone 1")
+      2. Fallback: Config.FALLBACK_HOTSPOT_SSID (regular iPhone e.g. "iPhone" or "iPhone 1")
 
     Retries every Config.HOTSPOT_RETRY_INTERVAL (15s) when internet is down.
     Never interrupts an active file transfer.
@@ -172,18 +172,27 @@ def ensure_internet_connection_wlan1(uploader: Optional[VantrueUploader] = None)
     active_conn = get_active_wifi_connection(Config.INTERNET_INTERFACE)
 
     pref_ssid = Config.PREFERRED_HOTSPOT_SSID
-    fallback_ssid = Config.FALLBACK_HOTSPOT_SSID
+    fallback_candidates = list(
+        dict.fromkeys(
+            [Config.FALLBACK_HOTSPOT_SSID]
+            + getattr(Config, "FALLBACK_HOTSPOT_CANDIDATES", ["iPhone", "iPhone 1"])
+        )
+    )
 
     # CASE 1: Internet is working
     if has_internet:
         if active_conn == pref_ssid:
             logger.info(f"wlan1: internet connection established via {pref_ssid}")
             return True
-        elif active_conn == fallback_ssid:
+        else:
+            # Connected to fallback hotspot or ambient connection (e.g. "iPhone", "iPhone 1")
             if is_transfer_in_progress():
                 logger.info("wlan1: active transfer in progress; skipping preferred hotspot check for now")
                 return True
 
+            logger.info(
+                f"wlan1: connected via {active_conn or 'fallback'}; scanning for preferred hotspot {pref_ssid}"
+            )
             if is_ssid_visible(pref_ssid, interface=Config.INTERNET_INTERFACE, rescan=True):
                 logger.info(f"wlan1: preferred hotspot {pref_ssid} became available; switching from fallback")
                 if connect(pref_ssid, interface=Config.INTERNET_INTERFACE, check_visibility=False):
@@ -191,10 +200,11 @@ def ensure_internet_connection_wlan1(uploader: Optional[VantrueUploader] = None)
                         logger.info(f"wlan1: internet connection established via {pref_ssid}")
                         return True
                     else:
-                        logger.warning(f"wlan1: preferred hotspot connection failed (no internet access); reverting to fallback")
-                        connect(fallback_ssid, interface=Config.INTERNET_INTERFACE, check_visibility=False)
-            return True
-        else:
+                        logger.warning(
+                            f"wlan1: preferred hotspot connection failed (no internet access); reverting to fallback"
+                        )
+                        revert_target = active_conn if active_conn else fallback_candidates[0]
+                        connect(revert_target, interface=Config.INTERNET_INTERFACE, check_visibility=False)
             logger.info(f"wlan1: internet connection established via {active_conn or 'existing connection'}")
             return True
 
@@ -217,17 +227,15 @@ def ensure_internet_connection_wlan1(uploader: Optional[VantrueUploader] = None)
     else:
         logger.info("wlan1: preferred hotspot unavailable")
 
-    fallback_visible = is_ssid_visible(fallback_ssid, interface=Config.INTERNET_INTERFACE, rescan=False)
-    if fallback_visible:
-        logger.info("wlan1: trying fallback iPhone hotspot")
-        if connect(fallback_ssid, interface=Config.INTERNET_INTERFACE, check_visibility=False):
-            if uploader_instance.check_internet_connectivity():
-                logger.info(f"wlan1: internet connection established via {fallback_ssid}")
-                return True
-            else:
-                logger.warning("wlan1: fallback hotspot connection failed")
-    else:
-        logger.info(f"wlan1: fallback hotspot '{fallback_ssid}' unavailable")
+    for fb in fallback_candidates:
+        if is_ssid_visible(fb, interface=Config.INTERNET_INTERFACE, rescan=False):
+            logger.info(f"wlan1: trying fallback iPhone hotspot '{fb}'")
+            if connect(fb, interface=Config.INTERNET_INTERFACE, check_visibility=False):
+                if uploader_instance.check_internet_connectivity():
+                    logger.info(f"wlan1: internet connection established via {fb}")
+                    return True
+                else:
+                    logger.warning(f"wlan1: fallback hotspot '{fb}' connection failed")
 
     logger.info(f"wlan1: no hotspot connection available, retrying in {Config.HOTSPOT_RETRY_INTERVAL} seconds")
     return False
