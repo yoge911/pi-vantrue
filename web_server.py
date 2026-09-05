@@ -231,7 +231,7 @@ class VantrueWebHandler(BaseHTTPRequestHandler):
             self._handle_api_videos(parsed_url.query)
         elif path.startswith("/stream/"):
             filename = urllib.parse.unquote(path[len("/stream/") :])
-            self._handle_stream_video(filename)
+            self._handle_stream_video(filename, parsed_url.query)
         else:
             self.send_error(HTTPStatus.NOT_FOUND, "Resource not found")
 
@@ -409,13 +409,16 @@ class VantrueWebHandler(BaseHTTPRequestHandler):
                 {"status": "error", "message": str(exc)},
             )
 
-    def _handle_stream_video(self, filename: str):
+    def _handle_stream_video(self, filename: str, query_str: str = ""):
         """
         Stream MP4 video file supporting HTTP Byte-Range requests for iOS Safari / Chrome seeking.
-        If file exists locally, stream directly from disk.
-        If file is cloud-synced (uploaded/deleted), proxy stream from Google Drive via rclone cat with Byte-Range support.
+        If file exists locally and source!=cloud, stream directly from disk.
+        If file is cloud-synced (uploaded/deleted) or source=cloud, proxy stream from Google Drive via rclone cat with Byte-Range support.
         Includes strict path traversal security checks.
         """
+        params = urllib.parse.parse_qs(query_str)
+        force_cloud = params.get("source", ["auto"])[0] == "cloud"
+
         base_dir = Config.LOCAL_DOWNLOAD_DIR.resolve()
         target_path = (base_dir / filename).resolve()
 
@@ -429,7 +432,7 @@ class VantrueWebHandler(BaseHTTPRequestHandler):
             content_type = "text/plain"
 
         # --- PATH A: FILE IS PRESENT ON LOCAL DISK ---
-        if target_path.exists() and target_path.is_file() and base_dir in target_path.parents:
+        if not force_cloud and target_path.exists() and target_path.is_file() and base_dir in target_path.parents:
             file_size = target_path.stat().st_size
             range_header = self.headers.get("Range")
 
@@ -726,7 +729,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             margin-top: 4px;
         }
         .action-btn {
-            margin-top: 8px;
             background: var(--accent-color);
             color: #0f172a;
             border: none;
@@ -735,10 +737,20 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             font-size: 0.85rem;
             font-weight: bold;
             cursor: pointer;
+            text-decoration: none;
+            display: inline-block;
         }
-        .cloud-btn {
+        .local-btn {
             background: var(--accent-green);
             color: #0f172a;
+        }
+        .cloud-btn {
+            background: var(--accent-color);
+            color: #0f172a;
+        }
+        .link-btn {
+            background: #334155;
+            color: var(--text-color);
         }
         video {
             width: 100%;
@@ -869,37 +881,45 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
                 container.innerHTML = data.videos.map(v => {
                     const isSynced = (v.status === 'uploaded' || v.status === 'deleted');
+                    const isLocal = Boolean(v.local_present);
                     const hasCloudUrl = Boolean(v.cloud_play_url);
-                    const canStream = Boolean(v.local_present || isSynced);
-                    const streamUrl = `/stream/${encodeURIComponent(v.filename)}`;
+                    const localStreamUrl = `/stream/${encodeURIComponent(v.filename)}?source=local`;
+                    const cloudStreamUrl = `/stream/${encodeURIComponent(v.filename)}?source=cloud`;
 
                     let actionHtml = '';
 
-                    if (canStream) {
-                        const playLabel = isSynced ? '▶️ Play Video (Cloud Proxy)' : '▶️ Play Video (Local Cache)';
-                        actionHtml += `<button class="action-btn cloud-btn" onclick="playVideo(this, '${streamUrl}')">${playLabel}</button>`;
+                    if (isLocal && isSynced) {
+                        actionHtml += `<button class="action-btn local-btn" onclick="playVideo(this, '${localStreamUrl}')">▶️ Play Local (Pi)</button>`;
+                        actionHtml += `<button class="action-btn cloud-btn" onclick="playVideo(this, '${cloudStreamUrl}')">☁️ Play Cloud (Proxy)</button>`;
+                        if (hasCloudUrl) {
+                            actionHtml += `<a href="${v.cloud_play_url}" target="_blank" class="action-btn link-btn">🔗 Drive Tab</a>`;
+                        }
+                    } else if (isLocal) {
+                        actionHtml += `<button class="action-btn local-btn" onclick="playVideo(this, '${localStreamUrl}')">▶️ Play Local (Pi)</button>`;
+                    } else if (isSynced) {
+                        actionHtml += `<button class="action-btn cloud-btn" onclick="playVideo(this, '${cloudStreamUrl}')">☁️ Play Cloud (Proxy)</button>`;
+                        if (hasCloudUrl) {
+                            actionHtml += `<a href="${v.cloud_play_url}" target="_blank" class="action-btn link-btn">🔗 Drive Tab</a>`;
+                        }
+                    } else {
+                        actionHtml = `<span style="font-size:0.8rem; color:var(--text-muted)">File purged / unavailable</span>`;
                     }
 
-                    if (isSynced && hasCloudUrl) {
-                        actionHtml += `<a href="${v.cloud_play_url}" target="_blank" class="action-btn" style="background:#334155; color:var(--text-color); text-decoration:none; display:inline-block; margin-left:6px;">🔗 Open Drive Tab</a>`;
-                    }
-
-                    if (!canStream && !hasCloudUrl) {
-                        actionHtml = `<span style="font-size:0.8rem; color:var(--text-muted)">File purged locally (Cloud link pending)</span>`;
-                    }
+                    const statusBadge = isSynced ? (isLocal ? 'Local + Cloud' : 'Cloud Only') : 'Local Only';
+                    const statusClass = isSynced ? 'pill-green' : 'pill-warn';
 
                     return `
                     <div class="video-item">
                         <div class="video-header">
                             <span class="video-title">${v.filename}</span>
-                            <span class="pill ${isSynced ? 'pill-green':'pill-warn'}">${isSynced ? 'Synced':'Waiting Upload'}</span>
+                            <span class="pill ${statusClass}">${statusBadge}</span>
                         </div>
                         <div class="video-meta">
                             <span>📅 ${v.recording_timestamp}</span>
                             <span>🏷️ ${v.category}</span>
                             <span>💾 ${v.file_size_mb} MB</span>
                         </div>
-                        <div style="margin-top:8px;">
+                        <div style="margin-top:8px; display:flex; flex-wrap:wrap; gap:6px; align-items:center;">
                             ${actionHtml}
                         </div>
                     </div>
@@ -908,13 +928,20 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         }
 
         function playVideo(btn, streamUrl) {
-            const parent = btn.parentElement;
-            const existingMedia = parent.querySelector('video');
+            const actionContainer = btn.parentElement;
+            const itemContainer = actionContainer.parentElement;
+            const existingMedia = itemContainer.querySelector('video');
+
             if (existingMedia) {
+                const currentSrc = existingMedia.getAttribute('data-stream-url');
                 existingMedia.remove();
-                const orig = btn.getAttribute('data-original-label');
-                if (orig) btn.innerText = orig;
-                return;
+                actionContainer.querySelectorAll('button').forEach(b => {
+                    const orig = b.getAttribute('data-original-label');
+                    if (orig) b.innerText = orig;
+                });
+                if (currentSrc === streamUrl) {
+                    return;
+                }
             }
 
             if (!btn.getAttribute('data-original-label')) {
@@ -925,15 +952,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             video.controls = true;
             video.preload = 'metadata';
             video.src = streamUrl;
+            video.setAttribute('data-stream-url', streamUrl);
             video.style.width = '100%';
             video.style.maxHeight = '360px';
             video.style.borderRadius = '8px';
             video.style.marginTop = '8px';
             video.style.background = '#000';
 
-            parent.appendChild(video);
+            itemContainer.appendChild(video);
             video.play().catch(e => console.log('Autoplay deferred:', e));
-            btn.innerText = 'Close Video Player';
+            btn.innerText = '⏹ Stop Playing';
         }
 
         function setFilter(filter, btn) {
