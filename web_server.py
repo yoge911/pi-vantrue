@@ -227,6 +227,7 @@ class VantrueWebHandler(BaseHTTPRequestHandler):
             drive_id = r["drive_file_id"] if ("drive_file_id" in r.keys() and r["drive_file_id"]) else None
             cloud_play_url = f"https://drive.google.com/file/d/{drive_id}/view" if drive_id else None
             cloud_embed_url = f"https://drive.google.com/file/d/{drive_id}/preview" if drive_id else None
+            cloud_direct_url = f"https://drive.google.com/uc?export=download&id={drive_id}" if drive_id else None
 
             cat_info = categorize_filename(fn)
             video_list.append(
@@ -240,6 +241,7 @@ class VantrueWebHandler(BaseHTTPRequestHandler):
                     "drive_file_id": drive_id,
                     "cloud_play_url": cloud_play_url,
                     "cloud_embed_url": cloud_embed_url,
+                    "cloud_direct_url": cloud_direct_url,
                     "local_present": is_present,
                     "category": cat_info["label"],
                     "category_type": cat_info["type"],
@@ -666,16 +668,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     let actionHtml = '';
 
                     if (isSynced && hasCloudUrl) {
-                        // Once uploaded, primary playback streams directly from Google Drive CDN
-                        actionHtml += `<button class="action-btn cloud-btn" onclick="playVideo(this, null, '${v.cloud_embed_url || ''}', '${v.cloud_play_url || ''}')">☁️ Play Cloud (Drive)</button>`;
+                        // Once uploaded, primary playback uses native HTML5 video element fed by direct Drive URL
+                        actionHtml += `<button class="action-btn cloud-btn" onclick="playVideo(this, null, '${v.cloud_embed_url || ''}', '${v.cloud_play_url || ''}', '${v.cloud_direct_url || ''}')">☁️ Play Cloud (Drive)</button>`;
                         actionHtml += `<a href="${v.cloud_play_url}" target="_blank" class="action-btn" style="background:#334155; color:var(--text-color); text-decoration:none; display:inline-block; margin-left:6px;">🔗 Open Drive Tab</a>`;
                         
                         if (hasLocalStream) {
-                            actionHtml += `<button class="action-btn" style="background:#0f172a; color:var(--text-muted); border:1px solid var(--border-color); margin-left:6px;" onclick="playVideo(this, '${v.stream_url}', null, null)">📱 Stream Local Pi</button>`;
+                            actionHtml += `<button class="action-btn" style="background:#0f172a; color:var(--text-muted); border:1px solid var(--border-color); margin-left:6px;" onclick="playVideo(this, '${v.stream_url}', null, null, null)">📱 Stream Local Pi</button>`;
                         }
                     } else if (hasLocalStream) {
                         // Unsynced video -> Stream locally from Pi
-                        actionHtml += `<button class="action-btn" onclick="playVideo(this, '${v.stream_url}', null, null)">📱 Play Local (Pi)</button>`;
+                        actionHtml += `<button class="action-btn" onclick="playVideo(this, '${v.stream_url}', null, null, null)">📱 Play Local (Pi)</button>`;
                     } else {
                         actionHtml = `<span style="font-size:0.8rem; color:var(--text-muted)">File purged locally (Cloud link pending)</span>`;
                     }
@@ -699,7 +701,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             } catch(e) { console.error('Video load error:', e); }
         }
 
-        function playVideo(btn, streamUrl, cloudEmbedUrl, cloudPlayUrl) {
+        function playVideo(btn, streamUrl, cloudEmbedUrl, cloudPlayUrl, cloudDirectUrl) {
             const parent = btn.parentElement;
             const existingMedia = parent.querySelector('video, iframe');
             if (existingMedia) {
@@ -713,7 +715,40 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 btn.setAttribute('data-original-label', btn.innerText);
             }
 
-            if (cloudEmbedUrl) {
+            const mediaUrl = cloudDirectUrl || streamUrl;
+
+            if (mediaUrl) {
+                const video = document.createElement('video');
+                video.controls = true;
+                video.preload = 'metadata';
+                video.src = mediaUrl;
+                video.style.width = '100%';
+                video.style.maxHeight = '360px';
+                video.style.borderRadius = '8px';
+                video.style.marginTop = '8px';
+                video.style.background = '#000';
+
+                if (cloudEmbedUrl) {
+                    video.onerror = function() {
+                        console.warn('Direct HTML5 cloud stream restricted; falling back to Drive iframe player.');
+                        video.remove();
+                        const iframe = document.createElement('iframe');
+                        iframe.src = cloudEmbedUrl;
+                        iframe.style.width = '100%';
+                        iframe.style.height = '360px';
+                        iframe.style.border = 'none';
+                        iframe.style.borderRadius = '8px';
+                        iframe.style.marginTop = '8px';
+                        iframe.allow = 'autoplay; encrypted-media; picture-in-picture';
+                        iframe.allowFullscreen = true;
+                        parent.appendChild(iframe);
+                    };
+                }
+
+                parent.appendChild(video);
+                video.play().catch(e => console.log('Autoplay deferred:', e));
+                btn.innerText = cloudDirectUrl ? 'Close Cloud Player' : 'Close Local Player';
+            } else if (cloudEmbedUrl) {
                 const iframe = document.createElement('iframe');
                 iframe.src = cloudEmbedUrl;
                 iframe.style.width = '100%';
@@ -725,19 +760,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 iframe.allowFullscreen = true;
                 parent.appendChild(iframe);
                 btn.innerText = 'Close Cloud Player';
-            } else if (streamUrl) {
-                const video = document.createElement('video');
-                video.controls = true;
-                video.preload = 'metadata';
-                video.src = streamUrl;
-                video.style.width = '100%';
-                video.style.maxHeight = '360px';
-                video.style.borderRadius = '8px';
-                video.style.marginTop = '8px';
-                video.style.background = '#000';
-                parent.appendChild(video);
-                video.play();
-                btn.innerText = 'Close Local Player';
             } else if (cloudPlayUrl) {
                 window.open(cloudPlayUrl, '_blank');
             }
