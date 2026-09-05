@@ -285,6 +285,40 @@ class SyncDB:
             )
             conn.commit()
 
+    def update_recording_status(
+        self,
+        filename: str,
+        status: str,
+        drive_file_id: Optional[str] = None,
+        clear_drive_id: bool = False,
+    ):
+        """Update recording status and optional drive_file_id by filename."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            if clear_drive_id:
+                cursor.execute(
+                    """
+                    UPDATE recordings
+                    SET status = ?,
+                        drive_file_id = NULL,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE filename = ?;
+                    """,
+                    (status, filename),
+                )
+            else:
+                cursor.execute(
+                    """
+                    UPDATE recordings
+                    SET status = ?,
+                        drive_file_id = COALESCE(?, drive_file_id),
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE filename = ?;
+                    """,
+                    (status, drive_file_id, filename),
+                )
+            conn.commit()
+
     def get_recordings_missing_drive_id(self, limit: int = 3) -> List[sqlite3.Row]:
         """Fetch historical cloud-synced (uploaded/deleted) recordings missing a Google Drive file ID for throttled backfill."""
         with self._get_connection() as conn:

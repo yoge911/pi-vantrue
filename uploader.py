@@ -5,7 +5,7 @@ import subprocess
 import time
 import urllib.request
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from config import Config
 from db import SyncDB
@@ -154,6 +154,29 @@ class VantrueUploader:
             if meta and meta.get("file_id"):
                 self.db.update_drive_file_id(remote_url, meta["file_id"])
                 logger.info(f"Drive metadata: cloud link stored for {filename}")
+
+    def delete_cloud_file(
+        self, filename: str, drive_file_id: Optional[str] = None
+    ) -> Tuple[bool, str]:
+        """
+        Delete a single file from Google Drive using rclone deletefile.
+        Returns (True, "Deleted from Google Drive") on success, or (False, error_message).
+        """
+        remote_target = f"{self.config.RCLONE_REMOTE}{self.config.RCLONE_DESTINATION}/{filename}"
+        cmd = ["rclone", "deletefile", remote_target]
+
+        logger.info(f"Drive deletion: deleting cloud file '{filename}' at target {remote_target}")
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if res.returncode == 0:
+                logger.info(f"Drive deletion: successfully deleted cloud file '{filename}'")
+                return True, "Deleted from Google Drive"
+            err = res.stderr.strip() if res.stderr else f"Exit code {res.returncode}"
+            logger.warning(f"Drive deletion failed for '{filename}': {err}")
+            return False, f"Google Drive deletion failed: {err}"
+        except Exception as exc:
+            logger.warning(f"Drive deletion exception for '{filename}': {exc}")
+            return False, f"Google Drive deletion failed: {exc}"
 
     def run_upload_cycle(
         self,

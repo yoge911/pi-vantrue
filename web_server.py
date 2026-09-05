@@ -245,6 +245,8 @@ class VantrueWebHandler(BaseHTTPRequestHandler):
             self._handle_api_rescan()
         elif path == "/api/backfill":
             self._handle_api_backfill()
+        elif path in ("/api/videos/delete", "/api/delete"):
+            self._handle_api_delete_videos()
         else:
             self.send_error(HTTPStatus.NOT_FOUND, "Endpoint not found")
 
@@ -424,6 +426,170 @@ class VantrueWebHandler(BaseHTTPRequestHandler):
             )
         except Exception as exc:
             logger.error(f"Manual backfill error: {exc}")
+            self._send_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {"status": "error", "message": str(exc)},
+            )
+
+    def _handle_api_delete_videos(self):
+        logger.info("Bulk video deletion requested via Web API.")
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+            if content_length <= 0:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"status": "error", "message": "Missing request payload."},
+                )
+                return
+
+            body = self.rfile.read(content_length).decode("utf-8")
+            data = json.loads(body)
+            filenames = data.get("filenames", [])
+            scope = data.get("scope", "local")  # "local", "cloud", "both"
+
+            if not filenames:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"status": "error", "message": "No filenames specified for deletion."},
+                )
+                return
+
+            from uploader import VantrueUploader
+
+            uploader = VantrueUploader(Config)
+            db = SyncDB(Config.DB_PATH)
+            base_dir = Config.LOCAL_DOWNLOAD_DIR.resolve()
+
+            results = []
+            successful_count = 0
+            failed_count = 0
+
+            for fn in filenames:
+                record = db.get_recording_by_filename(fn)
+                if not record:
+                    results.append(
+                        {
+                            "filename": fn,
+                            "status": "error",
+                            "message": "Record not found in database.",
+                        }
+                    )
+                    failed_count += 1
+                    continue
+
+                drive_id = (
+                    record["drive_file_id"]
+                    if ("drive_file_id" in record.keys() and record["drive_file_id"])
+                    else None
+                )
+                target_path = (base_dir / fn).resolve()
+
+                local_success = True
+                cloud_success = True
+                msg_parts = []
+
+                # A. Delete Local Pi Copy
+                if scope in ("local", "both"):
+                    if (
+                        target_path.exists()
+                        and target_path.is_file()
+                        and base_dir in target_path.parents
+                    ):
+                        try:
+                            target_path.unlink()
+                            msg_parts.append("Local Pi copy deleted")
+                        except Exception as exc:
+                            local_success = False
+                            msg_parts.append(f"Local deletion failed ({exc})")
+                    else:
+                        msg_parts.append("Local Pi copy already absent")
+
+                # B. Delete Cloud / Google Drive Copy
+                if scope in ("cloud", "both"):
+                    if drive_id or record["status"] in ("uploaded", "deleted"):
+                        ok, cloud_msg = uploader.delete_cloud_file(
+                            fn, drive_file_id=drive_id
+                        )
+                        if ok:
+                            cloud_success = True
+                            msg_parts.append("Cloud copy deleted")
+                        else:
+                            cloud_success = False
+                            msg_parts.append(cloud_msg)
+                    else:
+                        msg_parts.append("Cloud copy not present")
+
+                # C. Reconcile DB status based on results
+                is_overall_success = local_success and cloud_success
+                if is_overall_success:
+                    successful_count += 1
+                    new_is_local = target_path.exists() and target_path.is_file()
+
+                    if scope == "both":
+                        db.update_recording_status(
+                            fn, status="deleted", clear_drive_id=True
+                        )
+                    elif scope == "local":
+                        if record["status"] == "uploaded":
+                            db.update_recording_status(
+                                fn, status="deleted", clear_drive_id=False
+                            )
+                        elif record["status"] == "downloaded":
+                            db.update_recording_status(
+                                fn, status="discovered", clear_drive_id=False
+                            )
+                    elif scope == "cloud":
+                        if new_is_local:
+                            db.update_recording_status(
+                                fn, status="downloaded", clear_drive_id=True
+                            )
+                        else:
+                            db.update_recording_status(
+                                fn, status="deleted", clear_drive_id=True
+                            )
+
+                    results.append(
+                        {
+                            "filename": fn,
+                            "status": "success",
+                            "message": " / ".join(msg_parts),
+                        }
+                    )
+                else:
+                    failed_count += 1
+                    # Partial result reconciliation
+                    if local_success and scope in ("local", "both"):
+                        if record["status"] == "uploaded":
+                            db.update_recording_status(
+                                fn, status="deleted", clear_drive_id=False
+                            )
+                    if cloud_success and scope in ("cloud", "both"):
+                        db.update_recording_status(
+                            fn, status=record["status"], clear_drive_id=True
+                        )
+
+                    results.append(
+                        {
+                            "filename": fn,
+                            "status": "warning"
+                            if (local_success or cloud_success)
+                            else "error",
+                            "message": " / ".join(msg_parts),
+                        }
+                    )
+
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "status": "success" if failed_count == 0 else "partial",
+                    "total": len(filenames),
+                    "successful": successful_count,
+                    "failed": failed_count,
+                    "results": results,
+                },
+            )
+        except Exception as exc:
+            logger.error(f"Bulk delete handler error: {exc}", exc_info=True)
             self._send_json(
                 HTTPStatus.INTERNAL_SERVER_ERROR,
                 {"status": "error", "message": str(exc)},
@@ -833,17 +999,82 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
     <div class="card">
         <div class="card-title">Video Library</div>
-        <div class="filter-controls">
-            <button class="filter-btn active" onclick="setFilter('all', this)">All</button>
-            <button class="filter-btn" onclick="setFilter('uploaded', this)">Cloud Synced</button>
-            <button class="filter-btn" onclick="setFilter('downloaded', this)">Waiting Upload</button>
-            <button class="filter-btn" style="margin-left:auto;" onclick="triggerBackfill()">Sync Drive Links</button>
+        
+        <!-- Filter Controls: Camera & Location Status -->
+        <div style="display:flex; flex-direction:column; gap:8px; margin-bottom:12px;">
+            <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                <span style="font-size:0.8rem; color:var(--text-muted); min-width:65px;">Camera:</span>
+                <div class="filter-controls-camera" style="display:flex; gap:6px; flex-wrap:wrap;">
+                    <button class="filter-btn active" onclick="setCameraFilter('all', this)">All</button>
+                    <button class="filter-btn" onclick="setCameraFilter('Front', this)">Front</button>
+                    <button class="filter-btn" onclick="setCameraFilter('Rear', this)">Rear</button>
+                    <button class="filter-btn" onclick="setCameraFilter('Interior', this)">Interior</button>
+                </div>
+            </div>
+            
+            <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                <span style="font-size:0.8rem; color:var(--text-muted); min-width:65px;">Status:</span>
+                <div class="filter-controls-status" style="display:flex; gap:6px; flex-wrap:wrap;">
+                    <button class="filter-btn active" onclick="setStatusFilter('all', this)">All</button>
+                    <button class="filter-btn" onclick="setStatusFilter('uploaded', this)">Cloud Synced</button>
+                    <button class="filter-btn" onclick="setStatusFilter('downloaded', this)">Waiting Upload</button>
+                    <button class="filter-btn" onclick="setStatusFilter('discovered', this)">On Dashcam</button>
+                </div>
+                <button class="filter-btn" style="margin-left:auto;" onclick="triggerBackfill()">Sync Drive Links</button>
+            </div>
         </div>
+
+        <!-- Selection Toolbar -->
+        <div style="display:flex; justify-content:space-between; align-items:center; padding:8px 12px; background:#0f172a; border:1px solid var(--border-color); border-radius:8px; margin-bottom:12px;">
+            <label style="display:flex; align-items:center; gap:8px; font-size:0.85rem; font-weight:600; cursor:pointer;">
+                <input type="checkbox" id="select-all-cb" onchange="toggleSelectAll(this)">
+                <span>Select All (<span id="visible-count">0</span> visible)</span>
+            </label>
+            <button id="bulk-delete-btn" class="action-btn" style="background:var(--accent-alert); color:#fff; display:none;" onclick="openDeleteModal()">
+                🗑️ Delete Selected (<span id="selected-count">0</span>)
+            </button>
+        </div>
+
         <div id="video-list">Loading videos...</div>
     </div>
 
+    <!-- Delete Confirmation Modal -->
+    <div id="delete-modal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.75); z-index:1000; justify-content:center; align-items:center;">
+        <div style="background:var(--card-bg); border:1px solid var(--border-color); border-radius:12px; padding:20px; max-width:480px; width:90%; box-shadow:0 10px 25px rgba(0,0,0,0.5);">
+            <h3 style="margin-bottom:12px; color:var(--accent-color);">Confirm Bulk Deletion</h3>
+            <p style="font-size:0.9rem; color:var(--text-color); margin-bottom:16px;">
+                You are about to delete <b id="modal-selected-count">0</b> selected video(s).
+            </p>
+            
+            <div style="background:#0f172a; padding:12px; border-radius:8px; border:1px solid var(--border-color); margin-bottom:16px;">
+                <div style="font-size:0.85rem; font-weight:bold; margin-bottom:8px; color:var(--text-muted);">Select Deletion Scope:</div>
+                <label style="display:block; margin-bottom:8px; font-size:0.9rem; cursor:pointer;">
+                    <input type="radio" name="delete-scope" value="local" checked> Delete Local Pi copy only
+                </label>
+                <label style="display:block; margin-bottom:8px; font-size:0.9rem; cursor:pointer;">
+                    <input type="radio" name="delete-scope" value="cloud"> Delete Cloud / Google Drive copy only
+                </label>
+                <label style="display:block; font-size:0.9rem; cursor:pointer;">
+                    <input type="radio" name="delete-scope" value="both"> Delete both Local Pi + Google Drive
+                </label>
+            </div>
+
+            <div style="font-size:0.8rem; color:var(--text-muted); margin-bottom:16px; background:rgba(234,179,8,0.1); border-left:3px solid var(--accent-warn); padding:8px 12px; border-radius:4px;">
+                ℹ️ Note: Files stored on the Vantrue Dashcam SD card will NOT be deleted.
+            </div>
+
+            <div style="display:flex; justify-content:flex-end; gap:8px;">
+                <button class="filter-btn" onclick="closeDeleteModal()">Cancel</button>
+                <button class="action-btn" style="background:var(--accent-alert); color:#fff;" onclick="executeBulkDelete()">Confirm Delete</button>
+            </div>
+        </div>
+    </div>
+
     <script>
-        let currentFilter = 'all';
+        let allVideos = [];
+        let selectedFilenames = new Set();
+        let currentCameraFilter = 'all';
+        let currentStatusFilter = 'all';
 
         async function triggerBackfill() {
             try {
@@ -892,85 +1123,217 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
         async function loadVideos() {
             try {
-                const res = await fetch(`/api/videos?status=${currentFilter}`);
+                const res = await fetch('/api/videos?status=all');
                 const data = await res.json();
-                const container = document.getElementById('video-list');
-                
-                if (!data.videos || data.videos.length === 0) {
-                    container.innerHTML = '<div style="color:var(--text-muted); padding:12px 0;">No videos match filter.</div>';
-                    return;
+                allVideos = data.videos || [];
+                renderVideos();
+            } catch(e) { console.error('Video load error:', e); }
+        }
+
+        function setCameraFilter(camera, btn) {
+            currentCameraFilter = camera;
+            document.querySelectorAll('.filter-controls-camera .filter-btn').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            renderVideos();
+        }
+
+        function setStatusFilter(status, btn) {
+            currentStatusFilter = status;
+            document.querySelectorAll('.filter-controls-status .filter-btn').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            renderVideos();
+        }
+
+        function getFilteredVideos() {
+            return allVideos.filter(v => {
+                const matchesCamera = (currentCameraFilter === 'all' || v.category_position === currentCameraFilter);
+                let matchesStatus = true;
+                if (currentStatusFilter === 'uploaded') {
+                    matchesStatus = (v.file_state === 'cloud' || v.file_state === 'local+cloud' || v.status === 'uploaded');
+                } else if (currentStatusFilter === 'downloaded') {
+                    matchesStatus = (v.file_state === 'local' || v.status === 'downloaded');
+                } else if (currentStatusFilter === 'discovered') {
+                    matchesStatus = (v.file_state === 'dashcam' || v.status === 'discovered');
+                }
+                return matchesCamera && matchesStatus;
+            });
+        }
+
+        function renderVideos() {
+            const visibleVideos = getFilteredVideos();
+            document.getElementById('visible-count').innerText = visibleVideos.length;
+            
+            const selectAllCb = document.getElementById('select-all-cb');
+            if (visibleVideos.length > 0) {
+                selectAllCb.checked = visibleVideos.every(v => selectedFilenames.has(v.filename));
+            } else {
+                selectAllCb.checked = false;
+            }
+
+            updateSelectionUI();
+
+            const container = document.getElementById('video-list');
+            if (visibleVideos.length === 0) {
+                container.innerHTML = '<div style="color:var(--text-muted); padding:12px 0;">No videos match selected filter.</div>';
+                return;
+            }
+
+            container.innerHTML = visibleVideos.map(v => {
+                const isChecked = selectedFilenames.has(v.filename) ? 'checked' : '';
+                const hasCloudUrl = Boolean(v.cloud_play_url);
+                const localStreamUrl = `/stream/${encodeURIComponent(v.filename)}?source=local`;
+                const cloudStreamUrl = `/stream/${encodeURIComponent(v.filename)}?source=cloud`;
+
+                let stateBadge = '';
+                let stateClass = '';
+                let actionHtml = '';
+
+                switch (v.file_state) {
+                    case 'dashcam':
+                        stateBadge = '📷 On Dashcam';
+                        stateClass = 'pill-info';
+                        actionHtml = `<span style="font-size:0.85rem; color:var(--accent-color)">📷 On Dashcam (Awaiting Pi download)</span>`;
+                        break;
+                    case 'local':
+                        stateBadge = '💾 Local (Pi)';
+                        stateClass = 'pill-warn';
+                        actionHtml = `<button class="action-btn local-btn" onclick="playVideo(this, '${localStreamUrl}')">▶️ Play Local (Pi)</button>`;
+                        break;
+                    case 'local+cloud':
+                        stateBadge = '⚡ Local + Cloud';
+                        stateClass = 'pill-green';
+                        actionHtml = `<button class="action-btn local-btn" onclick="playVideo(this, '${localStreamUrl}')">▶️ Play Local (Pi)</button>`;
+                        actionHtml += `<button class="action-btn cloud-btn" onclick="playVideo(this, '${cloudStreamUrl}')">☁️ Play Cloud (Proxy)</button>`;
+                        if (hasCloudUrl) {
+                            actionHtml += `<a href="${v.cloud_play_url}" target="_blank" class="action-btn link-btn">🔗 Drive Tab</a>`;
+                        }
+                        break;
+                    case 'cloud':
+                        stateBadge = '☁️ Cloud Only';
+                        stateClass = 'pill-green';
+                        actionHtml = `<button class="action-btn cloud-btn" onclick="playVideo(this, '${cloudStreamUrl}')">☁️ Play Cloud (Proxy)</button>`;
+                        if (hasCloudUrl) {
+                            actionHtml += `<a href="${v.cloud_play_url}" target="_blank" class="action-btn link-btn">🔗 Drive Tab</a>`;
+                        }
+                        break;
+                    case 'missing':
+                        stateBadge = '⚠️ Missing Local File';
+                        stateClass = 'pill-alert';
+                        actionHtml = `<span style="font-size:0.85rem; color:var(--accent-alert)">⚠️ Local file missing unexpectedly on Pi</span>`;
+                        break;
+                    case 'purged':
+                        stateBadge = '🗑️ Local Purged';
+                        stateClass = 'pill-alert';
+                        actionHtml = `<span style="font-size:0.85rem; color:var(--text-muted)">Local copy purged</span>`;
+                        break;
+                    default:
+                        stateBadge = v.file_state || v.status;
+                        stateClass = 'pill-warn';
+                        actionHtml = `<span style="font-size:0.85rem; color:var(--text-muted)">Status: ${v.status}</span>`;
                 }
 
-                container.innerHTML = data.videos.map(v => {
-                    const hasCloudUrl = Boolean(v.cloud_play_url);
-                    const localStreamUrl = `/stream/${encodeURIComponent(v.filename)}?source=local`;
-                    const cloudStreamUrl = `/stream/${encodeURIComponent(v.filename)}?source=cloud`;
-
-                    let stateBadge = '';
-                    let stateClass = '';
-                    let actionHtml = '';
-
-                    switch (v.file_state) {
-                        case 'dashcam':
-                            stateBadge = '📷 On Dashcam';
-                            stateClass = 'pill-info';
-                            actionHtml = `<span style="font-size:0.85rem; color:var(--accent-color)">📷 On Dashcam (Awaiting Pi download)</span>`;
-                            break;
-                        case 'local':
-                            stateBadge = '💾 Local (Pi)';
-                            stateClass = 'pill-warn';
-                            actionHtml = `<button class="action-btn local-btn" onclick="playVideo(this, '${localStreamUrl}')">▶️ Play Local (Pi)</button>`;
-                            break;
-                        case 'local+cloud':
-                            stateBadge = '⚡ Local + Cloud';
-                            stateClass = 'pill-green';
-                            actionHtml = `<button class="action-btn local-btn" onclick="playVideo(this, '${localStreamUrl}')">▶️ Play Local (Pi)</button>`;
-                            actionHtml += `<button class="action-btn cloud-btn" onclick="playVideo(this, '${cloudStreamUrl}')">☁️ Play Cloud (Proxy)</button>`;
-                            if (hasCloudUrl) {
-                                actionHtml += `<a href="${v.cloud_play_url}" target="_blank" class="action-btn link-btn">🔗 Drive Tab</a>`;
-                            }
-                            break;
-                        case 'cloud':
-                            stateBadge = '☁️ Cloud Only';
-                            stateClass = 'pill-green';
-                            actionHtml = `<button class="action-btn cloud-btn" onclick="playVideo(this, '${cloudStreamUrl}')">☁️ Play Cloud (Proxy)</button>`;
-                            if (hasCloudUrl) {
-                                actionHtml += `<a href="${v.cloud_play_url}" target="_blank" class="action-btn link-btn">🔗 Drive Tab</a>`;
-                            }
-                            break;
-                        case 'missing':
-                            stateBadge = '⚠️ Missing Local File';
-                            stateClass = 'pill-alert';
-                            actionHtml = `<span style="font-size:0.85rem; color:var(--accent-alert)">⚠️ Local file missing unexpectedly on Pi</span>`;
-                            break;
-                        case 'purged':
-                            stateBadge = '🗑️ Local Purged';
-                            stateClass = 'pill-alert';
-                            actionHtml = `<span style="font-size:0.85rem; color:var(--text-muted)">Local copy purged</span>`;
-                            break;
-                        default:
-                            stateBadge = v.file_state || v.status;
-                            stateClass = 'pill-warn';
-                            actionHtml = `<span style="font-size:0.85rem; color:var(--text-muted)">Status: ${v.status}</span>`;
-                    }
-
-                    return `
-                    <div class="video-item">
-                        <div class="video-header">
+                return `
+                <div class="video-item">
+                    <div class="video-header">
+                        <label style="display:flex; align-items:center; gap:8px; cursor:pointer;">
+                            <input type="checkbox" class="video-cb" ${isChecked} onchange="toggleSelectVideo('${v.filename}', this.checked)">
                             <span class="video-title">${v.filename}</span>
-                            <span class="pill ${stateClass}">${stateBadge}</span>
-                        </div>
-                        <div class="video-meta">
-                            <span>📅 ${v.recording_timestamp}</span>
-                            <span>🏷️ ${v.category}</span>
-                            <span>💾 ${v.file_size_mb} MB</span>
-                        </div>
-                        <div style="margin-top:8px; display:flex; flex-wrap:wrap; gap:6px; align-items:center;">
-                            ${actionHtml}
-                        </div>
+                        </label>
+                        <span class="pill ${stateClass}">${stateBadge}</span>
                     </div>
-                `}).join('');
-            } catch(e) { console.error('Video load error:', e); }
+                    <div class="video-meta">
+                        <span>📅 ${v.recording_timestamp}</span>
+                        <span>🏷️ ${v.category}</span>
+                        <span>💾 ${v.file_size_mb} MB</span>
+                    </div>
+                    <div style="margin-top:8px; display:flex; flex-wrap:wrap; gap:6px; align-items:center;">
+                        ${actionHtml}
+                    </div>
+                </div>
+            `}).join('');
+        }
+
+        function toggleSelectVideo(filename, isSelected) {
+            if (isSelected) {
+                selectedFilenames.add(filename);
+            } else {
+                selectedFilenames.delete(filename);
+            }
+            const visibleVideos = getFilteredVideos();
+            const selectAllCb = document.getElementById('select-all-cb');
+            if (visibleVideos.length > 0) {
+                selectAllCb.checked = visibleVideos.every(v => selectedFilenames.has(v.filename));
+            }
+            updateSelectionUI();
+        }
+
+        function toggleSelectAll(cb) {
+            const visibleVideos = getFilteredVideos();
+            visibleVideos.forEach(v => {
+                if (cb.checked) {
+                    selectedFilenames.add(v.filename);
+                } else {
+                    selectedFilenames.delete(v.filename);
+                }
+            });
+            renderVideos();
+        }
+
+        function updateSelectionUI() {
+            const count = selectedFilenames.size;
+            document.getElementById('selected-count').innerText = count;
+            const btn = document.getElementById('bulk-delete-btn');
+            if (count > 0) {
+                btn.style.display = 'inline-block';
+            } else {
+                btn.style.display = 'none';
+            }
+        }
+
+        function openDeleteModal() {
+            if (selectedFilenames.size === 0) return;
+            document.getElementById('modal-selected-count').innerText = selectedFilenames.size;
+            const modal = document.getElementById('delete-modal');
+            modal.style.display = 'flex';
+        }
+
+        function closeDeleteModal() {
+            const modal = document.getElementById('delete-modal');
+            modal.style.display = 'none';
+        }
+
+        async function executeBulkDelete() {
+            const filenames = Array.from(selectedFilenames);
+            if (filenames.length === 0) return;
+
+            const scopeRadios = document.getElementsByName('delete-scope');
+            let scope = 'local';
+            for (const r of scopeRadios) {
+                if (r.checked) { scope = r.value; break; }
+            }
+
+            closeDeleteModal();
+
+            try {
+                const res = await fetch('/api/videos/delete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ filenames: filenames, scope: scope })
+                });
+                const data = await res.json();
+                
+                let summaryMsg = `Bulk deletion finished (Scope: ${scope}):\n` +
+                    `Total: ${data.total}, Successful: ${data.successful}, Failed: ${data.failed}\n\n`;
+                if (data.results && data.results.length > 0) {
+                    summaryMsg += data.results.map(r => `• ${r.filename}: ${r.message}`).join('\n');
+                }
+                alert(summaryMsg);
+
+                selectedFilenames.clear();
+                loadAll();
+            } catch(e) {
+                alert('Bulk deletion request error: ' + e);
+            }
         }
 
         function playVideo(btn, streamUrl) {
