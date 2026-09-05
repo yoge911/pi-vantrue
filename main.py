@@ -321,13 +321,14 @@ def network_cycle():
                 f"Vantrue Wi-Fi '{vantrue_net}' not visible on {vantrue_iface}. Active connection: {wlan0_active or 'none'}."
             )
 
-    # --- PATH 2: CLOUD UPLOADS ON wlan1 / INTERNET ---
+    # --- PATH 2: CLOUD UPLOADS & INTERNET MANAGEMENT ON wlan1 ---
     uploader = VantrueUploader()
-    pending_uploads = uploader.db.get_pending_uploads()
+    internet_active = ensure_internet_connection_wlan1(uploader=uploader)
 
+    pending_uploads = uploader.db.get_pending_uploads()
     if pending_uploads:
         logger.info(f"{len(pending_uploads)} recordings pending upload. Triggering upload check...")
-        if ensure_internet_connection_wlan1(uploader=uploader):
+        if internet_active:
             run_upload_cycle()
 
 
