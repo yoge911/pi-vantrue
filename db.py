@@ -102,7 +102,7 @@ class SyncDB:
                         cursor.execute("SELECT * FROM recordings WHERE filename = ?;", (fn,))
                         row = cursor.fetchone()
                         if row:
-                            if row["status"] == "deleted":
+                            if row["status"] in ("deleted", "discovered"):
                                 new_status = "uploaded" if (row["uploaded_at"] if "uploaded_at" in row.keys() else None) else "downloaded"
                                 cursor.execute(
                                     "UPDATE recordings SET status = ?, file_size = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;",

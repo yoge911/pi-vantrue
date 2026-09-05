@@ -327,16 +327,26 @@ def network_cycle():
 
     # --- PATH 2: CLOUD UPLOADS & INTERNET MANAGEMENT ON wlan1 ---
     uploader = VantrueUploader()
+    uploader.db.sync_physical_files(Config.LOCAL_DOWNLOAD_DIR)
+
     internet_active = ensure_internet_connection_wlan1(uploader=uploader)
 
     if internet_active:
         uploader.backfill_missing_drive_ids(max_batch=5)
 
     pending_uploads = uploader.db.get_pending_uploads()
-    if pending_uploads:
-        logger.info(f"{len(pending_uploads)} recordings pending upload. Triggering upload check...")
+    pending_count = len(pending_uploads)
+
+    if pending_count > 0:
         if internet_active:
+            logger.info(f"Upload queue: {pending_count} pending, internet available, starting upload")
             run_upload_cycle()
+        else:
+            logger.info(
+                f"Upload queue: {pending_count} pending. Upload skipped: internet connection unavailable on {Config.INTERNET_INTERFACE}"
+            )
+    else:
+        logger.info("Upload queue: 0 pending. Upload skipped: no recordings awaiting cloud upload")
 
 
 def main():

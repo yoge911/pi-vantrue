@@ -170,34 +170,39 @@ class VantrueUploader:
           5. Safe state transition: uploaded -> delete local file -> deleted.
           6. Throttled backfill for historical cloud-synced records missing Drive file IDs.
         """
+        self.db.sync_physical_files(self.config.LOCAL_DOWNLOAD_DIR)
         pending = self.db.get_pending_uploads()
 
         if not pending:
-            logger.debug("No recordings awaiting cloud upload.")
+            logger.info("Upload queue: 0 pending. Upload skipped: no recordings awaiting cloud upload")
             self.backfill_missing_drive_ids(max_batch=3)
             return
-
-        logger.info(f"{len(pending)} recordings awaiting upload.")
 
         # Network handling
         if self.config.IS_EXPLICIT_BASE_URL:
             logger.info("Mock mode active; verifying internet on current network...")
             if not self.check_internet_connectivity():
-                logger.info("Internet unavailable on current network. Upload postponed.")
+                logger.info(
+                    f"Upload queue: {len(pending)} pending. Upload skipped: internet unavailable in mock mode"
+                )
                 return
         else:
             if not self.check_internet_connectivity():
                 if connect_wifi_fn:
                     logger.info(f"Connecting wlan1 to hotspot network '{iphone_network_name}'...")
                     if not connect_wifi_fn(iphone_network_name):
-                        logger.info("Hotspot network unavailable. Upload postponed.")
+                        logger.info(
+                            f"Upload queue: {len(pending)} pending. Upload skipped: hotspot network '{iphone_network_name}' unavailable"
+                        )
                         return
 
                 if not self.check_internet_connectivity():
-                    logger.info("Internet connection unavailable on hotspot. Upload postponed.")
+                    logger.info(
+                        f"Upload queue: {len(pending)} pending. Upload skipped: internet connection unavailable on hotspot"
+                    )
                     return
 
-        logger.info("Internet connection available for cloud upload.")
+        logger.info(f"Upload queue: {len(pending)} pending, internet available, starting upload")
 
         for rec in pending:
             recording_dict = dict(rec)
